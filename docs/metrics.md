@@ -47,6 +47,67 @@ Details about this configuration can be found in the
 
 The metrics are written to the `metrics_path` in JSON format.
 
+## Attaching custom properties
+
+You can attach optional operator-defined key-value pairs to the metrics
+configuration. When set, Firecracker emits them under a top-level `properties`
+key on every metrics line; when unset, the output is unchanged.
+
+Properties are set together with the metrics path, either through the
+`PUT /metrics` API request or the `metrics` block of a configuration file. The
+`--metrics-path` CLI option configures only the path and cannot set properties.
+
+Like the rest of the metrics configuration, properties are set once before boot
+and are fixed for the lifetime of the microVM. They are bounded to keep metrics
+lines from growing without limit:
+
+- at most 10 key-value pairs;
+- keys up to 64 bytes;
+- values up to 512 bytes.
+
+Configure them via the API by adding a `properties` object to the request body:
+
+```bash
+curl --unix-socket /tmp/firecracker.socket -i \
+    -X PUT "http://localhost/metrics" \
+    -H "accept: application/json" \
+    -H "Content-Type: application/json" \
+    -d "{
+             \"metrics_path\": \"metrics.fifo\",
+             \"properties\": {
+                 \"customer_id\": \"1234\",
+                 \"bundle_id\": \"fn-abc\"
+             }
+    }"
+```
+
+The same fields can be provided in the `metrics` block of a configuration file
+passed via `--config-file`:
+
+```json
+{
+    "metrics": {
+        "metrics_path": "metrics.fifo",
+        "properties": {
+            "customer_id": "1234",
+            "bundle_id": "fn-abc"
+        }
+    }
+}
+```
+
+With no properties configured, a flushed line is unchanged:
+
+```json
+{"utc_timestamp_ms": 1739000000000, "api_server": {"...": 0}}
+```
+
+With the properties above, the same line carries them under `properties`:
+
+```json
+{"utc_timestamp_ms": 1739000000000, "properties": {"bundle_id": "fn-abc", "customer_id": "1234"}, "api_server": {"...": 0}}
+```
+
 ## Flushing the metrics
 
 The metrics get flushed in two ways:
@@ -128,6 +189,11 @@ Note: Firecracker emits all the above metrics regardless of the presense of that
 component i.e. even if `vsock` device is not attached to the Microvm,
 Firecracker will still emit the Vsock metrics with key as `vsock` and value of
 all metrics defined in `VsockDeviceMetrics` as `0`.
+
+Note: if custom properties were configured (see
+[Attaching custom properties](#attaching-custom-properties)), Firecracker also
+emits an optional top-level `properties` key holding those operator-defined
+pairs. This key is omitted when no properties are configured.
 
 ### Units for Firecracker metrics:
 

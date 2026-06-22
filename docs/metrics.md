@@ -47,25 +47,35 @@ Details about this configuration can be found in the
 
 The metrics are written to the `metrics_path` in JSON format.
 
-## Attaching custom properties
+## Optional metrics fields
 
-You can attach optional operator-defined key-value pairs to the metrics
-configuration. When set, Firecracker emits them under a top-level `properties`
-key on every metrics line; when unset, the output is unchanged.
+Firecracker can emit additional top-level fields on every metrics line. Each is
+opt-in and off by default, so the default output is unchanged. They are
+configured alongside `metrics_path`, through the `PUT /metrics` API request or
+the `metrics` block of a configuration file; the `--metrics-path` CLI option
+configures only the path. Like the rest of the metrics configuration, they are
+set once before boot and fixed for the lifetime of the microVM.
 
-Properties are set together with the metrics path, either through the
-`PUT /metrics` API request or the `metrics` block of a configuration file. The
-`--metrics-path` CLI option configures only the path and cannot set properties.
+### `id`
 
-Like the rest of the metrics configuration, properties are set once before boot
-and are fixed for the lifetime of the microVM. They are bounded to keep metrics
-lines from growing without limit:
+Set `emit_id` to `true` to emit the microVM instance id (the value passed to
+`--id`, defaulting to `anonymous-instance`) under a top-level `id` field. This
+lets lines collected from multiple microVMs into one destination be attributed
+to their source.
 
-- at most 10 key-value pairs;
-- keys up to 64 bytes;
-- values up to 512 bytes.
+### `properties`
 
-Configure them via the API by adding a `properties` object to the request body:
+Set `properties` to a map of operator-defined key-value pairs to emit them under
+a top-level `properties` field. The map is bounded to keep metrics lines from
+growing without limit:
+
+- up to 10 entries
+- keys up to 64 bytes
+- values up to 512 bytes
+
+### Examples
+
+Configure the fields via the API by adding them to the request body:
 
 ```bash
 curl --unix-socket /tmp/firecracker.socket -i \
@@ -74,6 +84,7 @@ curl --unix-socket /tmp/firecracker.socket -i \
     -H "Content-Type: application/json" \
     -d "{
              \"metrics_path\": \"metrics.fifo\",
+             \"emit_id\": true,
              \"properties\": {
                  \"customer_id\": \"1234\",
                  \"bundle_id\": \"fn-abc\"
@@ -88,6 +99,7 @@ passed via `--config-file`:
 {
     "metrics": {
         "metrics_path": "metrics.fifo",
+        "emit_id": true,
         "properties": {
             "customer_id": "1234",
             "bundle_id": "fn-abc"
@@ -96,16 +108,17 @@ passed via `--config-file`:
 }
 ```
 
-With no properties configured, a flushed line is unchanged:
+With neither field configured, a line carries only the default keys:
 
 ```json
 {"utc_timestamp_ms": 1739000000000, "api_server": {"...": 0}}
 ```
 
-With the properties above, the same line carries them under `properties`:
+With both fields configured as above, the same line also carries the instance id
+and the properties:
 
 ```json
-{"utc_timestamp_ms": 1739000000000, "properties": {"bundle_id": "fn-abc", "customer_id": "1234"}, "api_server": {"...": 0}}
+{"utc_timestamp_ms": 1739000000000, "id": "my-instance", "properties": {"bundle_id": "fn-abc", "customer_id": "1234"}, "api_server": {"...": 0}}
 ```
 
 ## Flushing the metrics
@@ -189,11 +202,6 @@ Note: Firecracker emits all the above metrics regardless of the presense of that
 component i.e. even if `vsock` device is not attached to the Microvm,
 Firecracker will still emit the Vsock metrics with key as `vsock` and value of
 all metrics defined in `VsockDeviceMetrics` as `0`.
-
-Note: if custom properties were configured (see
-[Attaching custom properties](#attaching-custom-properties)), Firecracker also
-emits an optional top-level `properties` key holding those operator-defined
-pairs. This key is omitted when no properties are configured.
 
 ### Units for Firecracker metrics:
 

@@ -22,7 +22,10 @@ const MAX_VALUE_LEN: usize = 512;
 pub struct MetricsConfig {
     /// Named pipe or file used as output for metrics.
     pub metrics_path: PathBuf,
-    /// Optional operator-defined key-value properties emitted on every metrics line.
+    /// Whether to emit the microVM instance id as a top-level `id` field on every metrics line.
+    #[serde(default)]
+    pub emit_id: bool,
+    /// Operator-defined key-value properties emitted on every metrics line.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub properties: Option<BTreeMap<String, String>>,
 }
@@ -73,6 +76,13 @@ pub fn init_metrics(metrics_cfg: MetricsConfig) -> Result<(), MetricsConfigError
         .init(writer)
         .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
 
+    if metrics_cfg.emit_id {
+        METRICS
+            .id
+            .enable()
+            .map_err(|err| MetricsConfigError::InitializationFailure(err.to_string()))?;
+    }
+
     if let Some(properties) = metrics_cfg.properties {
         METRICS
             .properties
@@ -91,14 +101,19 @@ mod tests {
 
     #[test]
     fn test_init_metrics() {
-        // Initializing metrics with valid pipe is ok.
+        // Initializing metrics with a valid pipe is ok. Enable both optional
+        // fields so their configuration paths are exercised.
         let metrics_file = TempFile::new().unwrap();
+        let mut properties = BTreeMap::new();
+        properties.insert("customer_id".to_string(), "1234".to_string());
         let desc = MetricsConfig {
             metrics_path: metrics_file.as_path().to_path_buf(),
-            properties: None,
+            emit_id: true,
+            properties: Some(properties),
         };
 
         init_metrics(desc.clone()).unwrap();
+        // Metrics can only be initialized once.
         init_metrics(desc).unwrap_err();
     }
 
@@ -121,5 +136,16 @@ mod tests {
         let mut long_value = BTreeMap::new();
         long_value.insert("k".to_string(), "v".repeat(MAX_VALUE_LEN + 1));
         validate_properties(&long_value).unwrap_err();
+    }
+
+    #[test]
+    fn test_emit_id_defaults_to_false() {
+        let cfg: MetricsConfig = serde_json::from_str(r#"{"metrics_path": "metrics"}"#).unwrap();
+        assert!(!cfg.emit_id);
+        assert_eq!(cfg.properties, None);
+
+        let cfg: MetricsConfig =
+            serde_json::from_str(r#"{"metrics_path": "metrics", "emit_id": true}"#).unwrap();
+        assert!(cfg.emit_id);
     }
 }

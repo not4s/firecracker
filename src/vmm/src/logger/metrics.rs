@@ -31,6 +31,11 @@
 //! named `block` which is in turn a serializable child structure collecting metrics for
 //! the block device such as `activate_fails`, `cfg_fails`, etc.
 //!
+//! Besides the per-component metrics, two top-level fields can be emitted, controlled
+//! independently via the metrics API or config file: `id`, the microVM instance id (the jailer
+//! `--id`), enabled by `emit_id`; and `properties`, a map of operator-defined key-value pairs.
+//! See the `InstanceIdField` and `MetricsProperties` structs.
+//!
 //! # Limitations
 //! Metrics are only written to buffers.
 //!
@@ -71,7 +76,7 @@ use std::sync::{Mutex, OnceLock};
 use serde::{Serialize, Serializer};
 use utils::time::{ClockType, get_time_ns, get_time_us};
 
-use super::FcLineWriter;
+use super::{DEFAULT_INSTANCE_ID, FcLineWriter, INSTANCE_ID};
 use crate::devices::legacy;
 use crate::devices::virtio::balloon::metrics as balloon_metrics;
 use crate::devices::virtio::block::virtio::metrics as block_metrics;
@@ -341,8 +346,7 @@ pub struct MetricsProperties {
 }
 
 impl Serialize for MetricsProperties {
-    /// Serializes as a `properties` map flattened into the parent metrics object,
-    /// or as nothing when unset.
+    /// Serializes as a flattened `properties` field when set, or as nothing when unset.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = serializer.serialize_map(None)?;
@@ -910,6 +914,48 @@ impl Serialize for SerializeToUtcTimestampMs {
     }
 }
 
+/// The microVM instance id emitted alongside the metrics.
+#[derive(Debug, Default)]
+pub struct InstanceIdField {
+    /// Whether the `id` field should be emitted. Flipped once at metrics configuration time.
+    enabled: OnceLock<()>,
+}
+
+impl Serialize for InstanceIdField {
+    /// Serializes as a flattened `id` field (the jailer `--id`) when enabled, or as nothing when
+    /// disabled.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        if self.enabled.get().is_some() {
+            map.serialize_entry(
+                "id",
+                INSTANCE_ID
+                    .get()
+                    .map(String::as_str)
+                    .unwrap_or(DEFAULT_INSTANCE_ID),
+            )?;
+        }
+        map.end()
+    }
+}
+
+impl InstanceIdField {
+    /// Const default construction.
+    pub const fn new() -> Self {
+        Self {
+            enabled: OnceLock::new(),
+        }
+    }
+
+    /// Enables emission of the `id` field. Returns an error if already enabled.
+    pub fn enable(&self) -> Result<(), MetricsError> {
+        self.enabled
+            .set(())
+            .map_err(|_| MetricsError::AlreadyInitialized)
+    }
+}
+
 macro_rules! create_serialize_proxy {
     // By using the below structure in FirecrackerMetrics it is easy
     // to serialise Firecracker app_metrics as a single json object which
@@ -944,6 +990,9 @@ create_serialize_proxy!(MemoryHotplugSerializeProxy, virtio_mem_metrics);
 #[derive(Debug, Default, Serialize)]
 pub struct FirecrackerMetrics {
     utc_timestamp_ms: SerializeToUtcTimestampMs,
+    #[serde(flatten)]
+    /// The microVM instance id (jailer `--id`), emitted when enabled.
+    pub id: InstanceIdField,
     #[serde(flatten)]
     /// Operator-supplied custom properties.
     pub properties: MetricsProperties,
@@ -1006,6 +1055,7 @@ impl FirecrackerMetrics {
     pub const fn new() -> Self {
         Self {
             utc_timestamp_ms: SerializeToUtcTimestampMs::new(),
+            id: InstanceIdField::new(),
             properties: MetricsProperties::new(),
             api_server: ApiServerMetrics::new(),
             balloon_ser: BalloonMetricsSerializeProxy {},
@@ -1067,6 +1117,27 @@ mod tests {
         let f = TempFile::new().expect("Failed to create temporary metrics file");
 
         m.init(LineWriter::new(f.into_file())).unwrap_err();
+    }
+
+    #[test]
+    fn test_instance_id_serialize_disabled() {
+        let id = InstanceIdField::new();
+        assert_eq!(serde_json::to_string(&id).unwrap(), "{}");
+    }
+
+    #[test]
+    fn test_instance_id_serialize_enabled() {
+        let id = InstanceIdField::new();
+        id.enable().unwrap();
+        let out = serde_json::to_string(&id).unwrap();
+        assert!(out.contains(r#""id":"#));
+    }
+
+    #[test]
+    fn test_instance_id_enable_once() {
+        let id = InstanceIdField::new();
+        id.enable().unwrap();
+        id.enable().unwrap_err();
     }
 
     #[test]

@@ -157,6 +157,9 @@ for test in tests:
     command.extend(pipeline.devtool_test(devtool_opts, test_script_opts))
     pipeline.build_group(
         command=command,
+        # Generous per-step timeout so long A/B suites (esp. network, which runs
+        # the full matrix twice) complete instead of hitting the default cap.
+        timeout_in_minutes=test.pop("timeout_in_minutes", 480),
         # and the rest can be command arguments
         **test,
     )

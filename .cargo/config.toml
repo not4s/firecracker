@@ -4,6 +4,26 @@ rustflags = [
   "-Ccodegen-units=1",
 ]
 
+# EXPERIMENT (exp/arm-lse-atomics): force inline LSE atomics on aarch64 to test
+# whether the Graviton MemoryRegionCache regression is the Rust `+outline-atomics`
+# indirect-call tax (Rank 1 in arm-regression-causes.md) rather than the abstraction.
+# Target-scoped so x86 builds are unaffected. NOTE: a [target.*] rustflags block
+# REPLACES [build].rustflags for that target, so -Ccodegen-units=1 is repeated here
+# to keep the ARM build otherwise identical to A.
+[target.aarch64-unknown-linux-musl]
+rustflags = [
+  "-Ccodegen-units=1",
+  "-Ctarget-cpu=neoverse-n1",
+]
+
+# Firecracker supports both musl (default) and glibc; cover gnu too so the flag
+# is not a silent no-op if the build ever links glibc on aarch64.
+[target.aarch64-unknown-linux-gnu]
+rustflags = [
+  "-Ccodegen-units=1",
+  "-Ctarget-cpu=neoverse-n1",
+]
+
 [net]
 git-fetch-with-cli = true
 retry = 10

@@ -88,9 +88,22 @@ impl AtomicBitmap {
                 break;
             }
             if set {
-                self.map[n >> 6].fetch_or(1 << (n & 63), Ordering::SeqCst);
+                // EXPERIMENT (exp/arm-relaxed-dirty-bitmap): SeqCst -> Relaxed on the
+                // per-I/O dirty-bitmap mutation. Tests Rank 3 in arm-regression-causes.md:
+                // on ARM, SeqCst emits the acquire-release LSE atomic (ldsetal, with a
+                // barrier); only Relaxed drops to a bare ldset. This is the ONE lever the
+                // LSE build-flag experiment (build #10/#11) could not pull. Correctness
+                // rationale: the bit is self-describing (no separate payload to publish),
+                // and the real happens-before is the snapshot/migration CHECKPOINT barrier
+                // (vCPUs paused + KVM ioctls) at collection time, not per-bit ordering.
+                // SHIPPING GATE: the collector (get_and_reset below) is still SeqCst; a
+                // Relaxed-setter / SeqCst-collector mix that runs concurrently WITHOUT the
+                // checkpoint fence is exactly the ARM hazard Bonzini's QEMU barrier series
+                // documents. Must audit Firecracker's writer/collector pairing before this
+                // could ship. This branch is a perf measurement, not a merge candidate.
+                self.map[n >> 6].fetch_or(1 << (n & 63), Ordering::Relaxed);
             } else {
-                self.map[n >> 6].fetch_and(!(1 << (n & 63)), Ordering::SeqCst);
+                self.map[n >> 6].fetch_and(!(1 << (n & 63)), Ordering::Relaxed);
             }
         }
     }
@@ -108,7 +121,8 @@ impl AtomicBitmap {
             // Attempts to set bits beyond the end of the bitmap are simply ignored.
             return;
         }
-        self.map[index >> 6].fetch_or(1 << (index & 63), Ordering::SeqCst);
+        // EXPERIMENT (exp/arm-relaxed-dirty-bitmap): SeqCst -> Relaxed, see set_reset_addr_range.
+        self.map[index >> 6].fetch_or(1 << (index & 63), Ordering::Relaxed);
     }
 
     /// Reset bit to corresponding index
@@ -117,7 +131,8 @@ impl AtomicBitmap {
             // Attempts to reset bits beyond the end of the bitmap are simply ignored.
             return;
         }
-        self.map[index >> 6].fetch_and(!(1 << (index & 63)), Ordering::SeqCst);
+        // EXPERIMENT (exp/arm-relaxed-dirty-bitmap): SeqCst -> Relaxed, see set_reset_addr_range.
+        self.map[index >> 6].fetch_and(!(1 << (index & 63)), Ordering::Relaxed);
     }
 
     /// Get the length of the bitmap in bits (i.e. in how many pages it can represent).

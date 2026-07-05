@@ -168,8 +168,15 @@ impl<'a> WithBitmapSlice<'a> for AtomicBitmap {
 }
 
 impl Bitmap for AtomicBitmap {
-    fn mark_dirty(&self, offset: usize, len: usize) {
-        self.set_addr_range(offset, len)
+    fn mark_dirty(&self, _offset: usize, _len: usize) {
+        // EXPERIMENT (exp/arm-no-dirty-tracking): no-op the per-write dirty marking to
+        // isolate whether the dirty-bitmap atomic (as an operation, not just its ordering)
+        // is the ARM regression cost. Rank-1 (LSE, build #10) and Rank-3 (SeqCst->Relaxed,
+        // build #14) were both refuted, so this removes the atomic ENTIRELY on the hot path.
+        // If Graviton h2g recovers toward main -> the atomic was the cost; if it still shows
+        // ~-5% -> the cost is the region/read_obj abstraction, not dirty tracking.
+        // NOT SHIPPABLE: disabling dirty tracking breaks snapshot/live-migration correctness
+        // (dirty pages would be missed). Measurement-only branch, never a merge candidate.
     }
 
     fn dirty_at(&self, offset: usize) -> bool {

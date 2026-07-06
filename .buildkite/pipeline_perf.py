@@ -41,6 +41,8 @@ perf_test = {
         "label": "network",
         "tests": "integration_tests/performance/test_network.py",
         "devtool_opts": "-c 1-10 -m 0",
+        # 2% gate (vs default 5%) so every cell's exact delta prints to the log.
+        "ab_opts": "--noise-threshold 0.02",
     },
     "vsock-throughput": {
         "label": "vsock-throughput",

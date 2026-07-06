@@ -74,13 +74,25 @@ impl MemoryRegionCache {
     }
 
     /// Read a `T` at the given byte offset within the cached range.
+    ///
+    /// EXPERIMENT (exp/arm-aligned-fastpath): aligned fast path. `get_slice` still does the
+    /// bounds check; then we do a single direct `read_volatile::<T>` instead of the generic
+    /// `Bytes::read_obj` -> `read_slice` -> `copy_slice_volatile` path, which (being alignment-
+    /// agnostic) emits a runtime alignment branch + a stack round-trip. On aarch64 that
+    /// generic path is ~4-6 instrs + a branch vs a single `ldrh`/`ldr`; this collapses it back
+    /// to one aligned load. Safe because MemoryRegionCache validated single-region containment
+    /// and the ring fields are naturally aligned (u16/UsedElement at aligned offsets).
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
+        let slice = self
+            .region
             .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::read_obj(&slice, 0).map_err(Into::into))
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        // SAFETY: `get_slice` validated `[addr, addr+size_of::<T>())` is in-region; the pointer
+        // is valid for a read of `T`; `T: ByteValued` so any bit pattern is valid.
+        let val = unsafe { std::ptr::read_volatile(slice.ptr_guard().as_ptr() as *const T) };
+        Ok(val)
     }
 
     /// Write a `T` at the given byte offset within the cached range.
@@ -91,10 +103,17 @@ impl MemoryRegionCache {
         offset: usize,
     ) -> Result<(), GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
+        let slice = self
+            .region
             .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        // SAFETY: as in read_obj; pointer valid for a write of `T`.
+        unsafe {
+            std::ptr::write_volatile(slice.ptr_guard_mut().as_ptr() as *mut T, val);
+        }
+        // Preserve dirty tracking (this is what the generic write_obj did via the slice bitmap).
+        slice.bitmap().mark_dirty(0, std::mem::size_of::<T>());
+        Ok(())
     }
 }
 

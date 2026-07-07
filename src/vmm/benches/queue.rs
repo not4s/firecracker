@@ -66,9 +66,9 @@ pub fn queue_benchmark(c: &mut Criterion) {
     let desc = queue.pop().unwrap().unwrap();
     c.bench_function("next_descriptor_16", |b| {
         b.iter(|| {
-            let mut head = Some(desc);
+            let mut head = Some(desc.clone());
             while let Some(d) = head {
-                head = std::hint::black_box(d.next_descriptor());
+                head = std::hint::black_box(d.next_descriptor(&mem));
             }
         })
     });

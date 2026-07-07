@@ -1189,8 +1189,11 @@ mod tests {
 
         assert!(vq.end().0 < 0x1000);
 
+        let desc_table_size = 16 * std::mem::size_of::<Descriptor>();
+        let desc_cache = MemoryRegionCache::new(m, q.desc_table_address, desc_table_size).unwrap();
+
         // index >= queue_size
-        assert!(DescriptorChain::checked_new(m, q.desc_table_address, 16, 16).is_none());
+        assert!(DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 16).is_none());
 
         // Let's create an invalid chain.
         {
@@ -1201,7 +1204,7 @@ mod tests {
             // .. but the index of the next descriptor is too large
             vq.dtable[0].next.set(16);
 
-            assert!(DescriptorChain::checked_new(m, q.desc_table_address, 16, 0).is_none());
+            assert!(DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 0).is_none());
         }
 
         // Finally, let's test an ok chain.
@@ -1209,7 +1212,7 @@ mod tests {
             vq.dtable[0].next.set(1);
             vq.dtable[1].set(0x2000, 0x1000, 0, 0);
 
-            let c = DescriptorChain::checked_new(m, q.desc_table_address, 16, 0).unwrap();
+            let c = DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 0).unwrap();
 
             assert_eq!(c.desc_table, q.desc_table_address);
             assert_eq!(c.queue_size, 16);

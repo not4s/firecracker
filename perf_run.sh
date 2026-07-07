@@ -15,10 +15,14 @@ LOG=/root/fc-$TAG.log
 KERNEL=$(ls $FCDIR/vmlinux* | tail -1)
 ROOTFS=$(ls $FCDIR/*.ext4 | tail -1)
 KEY=$(ls $FCDIR/*.id_rsa | tail -1)
-COUNTERS="cycles,instructions,stall_backend,stall_frontend,l1d_cache,l1d_cache_refill,l2d_cache,l2d_cache_refill,ll_cache_miss_rd,mem_access,br_mis_pred_retired,br_retired"
+# Split into two groups of <=6 so the PMU doesn't multiplex counters out to <not counted>.
+COUNTERS_A="cycles,instructions,stall_backend,l1d_cache,l1d_cache_refill,l2d_cache_refill"
+COUNTERS_B="cycles,instructions,ll_cache_miss_rd,mem_access,br_mis_pred_retired,stall_frontend"
 
 echo "== $TAG: bin=$BIN kernel=$KERNEL rootfs=$ROOTFS =="
 echo -1 > /proc/sys/kernel/perf_event_paranoid
+# host needs iperf3 to drive traffic (AL2023: dnf)
+which iperf3 >/dev/null 2>&1 || dnf install -y iperf3 >/dev/null 2>&1 || echo "WARN: could not install iperf3 on host"
 
 # (re)create the tap (idempotent)
 ip link del $TAP 2>/dev/null || true
@@ -70,12 +74,15 @@ echo "GUEST UP."
 $SSH "which iperf3 >/dev/null 2>&1 || (apt-get update && apt-get install -y iperf3)" >/dev/null 2>&1
 $SSH "pkill iperf3 2>/dev/null; iperf3 -s -D" 2>/dev/null
 sleep 1
-# h2g transfer (host client, reverse = data flows host->guest); background it
-( iperf3 -c $GUEST_IP -t 25 -R >/tmp/iperf-$TAG.txt 2>&1 ) &
+# h2g transfer (host client, reverse = data flows host->guest); long enough to cover
+# warmup + two perf passes (6 + 12 + 12 + margin).
+( iperf3 -c $GUEST_IP -t 40 -R >/tmp/iperf-$TAG.txt 2>&1 ) &
 IPERF=$!
 sleep 6   # warmup / steady state
-echo "==== PERF $TAG (FC pid $FCPID) ===="
-perf stat -e "$COUNTERS" -p $FCPID -- sleep 12
+echo "==== PERF $TAG group A (FC pid $FCPID) ===="
+perf stat -e "$COUNTERS_A" -p $FCPID -- sleep 12
+echo "==== PERF $TAG group B (FC pid $FCPID) ===="
+perf stat -e "$COUNTERS_B" -p $FCPID -- sleep 12
 echo "==== END PERF $TAG ===="
 wait $IPERF 2>/dev/null
 tail -3 /tmp/iperf-$TAG.txt

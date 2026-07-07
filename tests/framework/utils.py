@@ -133,6 +133,41 @@ def track_cpu_utilization(
     return cpu_utilization
 
 
+def track_perf_stat(pid: int, duration: int, omit: int) -> str:
+    """EXPERIMENT (ARM-regression root-cause): attach `perf stat` to the Firecracker
+    process for `duration` seconds, after sleeping `omit` seconds (past iperf warmup),
+    to capture PMU counters during steady-state h2g. Returns the perf output (or an
+    error marker). Degrades gracefully: never raises, so it cannot break the test.
+    """
+    time.sleep(omit)
+    counters = (
+        "cycles,instructions,stall_backend,stall_frontend,"
+        "l1d_cache,l1d_cache_refill,l2d_cache,l2d_cache_refill,"
+        "ll_cache_miss_rd,mem_access,br_mis_pred_retired,br_retired"
+    )
+    try:
+        # perf must be able to read the PMU; lower paranoid if we can (best-effort).
+        subprocess.run(
+            "echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid",
+            shell=True,
+            check=False,
+            capture_output=True,
+        )
+        res = subprocess.run(
+            ["perf", "stat", "-e", counters, "--pid", str(pid), "--", "sleep", str(duration)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        # perf writes the stat table to stderr
+        out = res.stderr or res.stdout or "(no perf output)"
+        return f"=== PERF STAT pid={pid} dur={duration}s ===\n{out}"
+    except FileNotFoundError:
+        return "=== PERF STAT UNAVAILABLE: perf binary not found in this context ==="
+    except Exception as exc:  # pylint: disable=broad-except
+        return f"=== PERF STAT FAILED: {exc} ==="
+
+
 def get_resident_memory(process: psutil.Process):
     """Returns current memory utilization in KiB, including used HugeTLBFS"""
 

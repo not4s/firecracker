@@ -7,7 +7,12 @@ import json
 import time
 
 from framework import utils
-from framework.utils import CmdBuilder, CpuMap, track_cpu_utilization
+from framework.utils import (
+    CmdBuilder,
+    CpuMap,
+    track_cpu_utilization,
+    track_perf_stat,
+)
 
 
 class IPerf3Test:
@@ -63,6 +68,18 @@ class IPerf3Test:
                 self._omit,
             )
 
+            # EXPERIMENT (ARM-regression root-cause): perf-stat the FC process during
+            # steady-state, h2g only (the regressing direction). Window = after warmup,
+            # before teardown. Result is printed below so it lands in the CI log.
+            perf_future = None
+            if self._mode == "h2g":
+                perf_future = executor.submit(
+                    track_perf_stat,
+                    self._microvm.firecracker_pid,
+                    max(self._runtime - self._omit - 2, 3),
+                    self._omit,
+                )
+
             clients = []
             for client_idx in range(self._num_clients):
                 client_future = executor.submit(
@@ -76,6 +93,10 @@ class IPerf3Test:
 
             for mode, future in clients:
                 data[mode].append(json.loads(future.result()))
+
+            if perf_future is not None:
+                # Print prominently so it's greppable in the CI log (per revision).
+                print(f"\nPERFSTAT_MARKER {self._microvm.dimensions}\n{perf_future.result()}\n")
 
             return data
 

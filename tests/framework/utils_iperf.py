@@ -4,6 +4,7 @@
 
 import concurrent.futures
 import json
+import logging
 import time
 
 from framework import utils
@@ -13,6 +14,8 @@ from framework.utils import (
     track_cpu_utilization,
     track_perf_stat,
 )
+
+LOG = logging.getLogger(__name__)
 
 
 class IPerf3Test:
@@ -95,8 +98,22 @@ class IPerf3Test:
                 data[mode].append(json.loads(future.result()))
 
             if perf_future is not None:
-                # Print prominently so it's greppable in the CI log (per revision).
-                print(f"\nPERFSTAT_MARKER {self._microvm.dimensions}\n{perf_future.result()}\n")
+                perf_out = perf_future.result()
+                # log_cli_level=ERROR, so use LOG.error to surface LIVE in the CI console
+                # (WARNING/print get captured+discarded on PASS). Also dump to a test_results
+                # file (uploaded as an artifact) as the reliable, capture-proof record.
+                LOG.error("PERFSTAT_MARKER %s\n%s", self._microvm.dimensions, perf_out)
+                try:
+                    from pathlib import Path
+
+                    d = self._microvm.dimensions
+                    tag = f"{d.get('instance','?')}_{d.get('host_kernel','?')}_{d.get('guest_kernel','?')}_{d.get('pci','?')}"
+                    p = Path("../test_results") / f"perfstat_{tag}.txt"
+                    p.parent.mkdir(parents=True, exist_ok=True)
+                    with p.open("a", encoding="utf-8") as f:
+                        f.write(f"PERFSTAT_MARKER {d}\n{perf_out}\n\n")
+                except Exception as exc:  # pylint: disable=broad-except
+                    LOG.error("PERFSTAT file write failed: %s", exc)
 
             return data
 

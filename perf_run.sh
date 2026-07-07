@@ -74,9 +74,12 @@ echo "GUEST UP."
 $SSH "which iperf3 >/dev/null 2>&1 || (apt-get update && apt-get install -y iperf3)" >/dev/null 2>&1
 $SSH "pkill iperf3 2>/dev/null; iperf3 -s -D" 2>/dev/null
 sleep 1
-# h2g transfer (host client, reverse = data flows host->guest); long enough to cover
-# warmup + two perf passes (6 + 12 + 12 + margin).
-( iperf3 -c $GUEST_IP -t 40 -R >/tmp/iperf-$TAG.txt 2>&1 ) &
+# h2g transfer = data flows host->guest = FC RX path (writes into guest mem, the
+# regressing direction). Topology here is server-in-guest + client-on-host, so the
+# host client must SEND (NO -R): host->guest. (-R would make the host client receive
+# = g2h, the WRONG direction; the A/B test gets h2g via server-on-host+client-in-guest+-R.)
+# Long enough to cover warmup + two perf passes (6 + 12 + 12 + margin).
+( iperf3 -c $GUEST_IP -t 40 >/tmp/iperf-$TAG.txt 2>&1 ) &
 IPERF=$!
 sleep 6   # warmup / steady state
 echo "==== PERF $TAG group A (FC pid $FCPID) ===="

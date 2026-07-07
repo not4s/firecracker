@@ -98,22 +98,14 @@ class IPerf3Test:
                 data[mode].append(json.loads(future.result()))
 
             if perf_future is not None:
-                perf_out = perf_future.result()
-                # log_cli_level=ERROR, so use LOG.error to surface LIVE in the CI console
-                # (WARNING/print get captured+discarded on PASS). Also dump to a test_results
-                # file (uploaded as an artifact) as the reliable, capture-proof record.
-                LOG.error("PERFSTAT_MARKER %s\n%s", self._microvm.dimensions, perf_out)
-                try:
-                    from pathlib import Path
-
-                    d = self._microvm.dimensions
-                    tag = f"{d.get('instance','?')}_{d.get('host_kernel','?')}_{d.get('guest_kernel','?')}_{d.get('pci','?')}"
-                    p = Path("../test_results") / f"perfstat_{tag}.txt"
-                    p.parent.mkdir(parents=True, exist_ok=True)
-                    with p.open("a", encoding="utf-8") as f:
-                        f.write(f"PERFSTAT_MARKER {d}\n{perf_out}\n\n")
-                except Exception as exc:  # pylint: disable=broad-except
-                    LOG.error("PERFSTAT file write failed: %s", exc)
+                # LOG.info reaches the live CI console because pytest.ini's log_cli_level is
+                # set to INFO for this experiment. (print()/WARNING get captured+dropped on a
+                # PASS; artifacts are unreachable, so the console log is our only channel.)
+                LOG.info(
+                    "PERFSTAT_MARKER %s\n%s",
+                    self._microvm.dimensions,
+                    perf_future.result(),
+                )
 
             return data
 

@@ -73,6 +73,23 @@ impl MemoryRegionCache {
         })
     }
 
+    /// Acquire a `VolatileSlice` covering the whole cached range, once.
+    ///
+    /// This is the crosvm-style amortization: callers that touch several fields
+    /// of the same ring (e.g. one `pop()` reading avail.idx then avail.ring[i])
+    /// build ONE slice here and then use [`read_obj_at`]/[`write_obj_at`] to index
+    /// within it, instead of paying a fresh `get_slice` (bounds check + bitmap
+    /// sub-slice + VolatileSlice construction) per field. The slice borrows `self`,
+    /// so it is a stack local for the duration of the operation, nothing raw is
+    /// stored, so this does NOT reintroduce `unsafe impl Send` for `Queue`.
+    #[inline]
+    pub fn slice(&self) -> Result<VolatileSlice<'_, BS<'_, Option<AtomicBitmap>>>, GuestMemoryError> {
+        let addr = MemoryRegionAddress(self.region_offset as u64);
+        self.region
+            .get_slice(addr, self.len)
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
+    }
+
     /// Read a `T` at the given byte offset within the cached range.
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
@@ -96,6 +113,28 @@ impl MemoryRegionCache {
             .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
             .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
     }
+}
+
+/// Read a `T` at `offset` within an already-acquired ring slice (see
+/// [`MemoryRegionCache::slice`]). Bounds are re-checked by `Bytes::read_obj`
+/// against the slice length, so this stays safe (the CVE's per-access check is
+/// preserved), it just skips re-acquiring the slice per field.
+#[inline]
+pub fn read_obj_at<T: ByteValued, B: BitmapSlice>(
+    slice: &VolatileSlice<'_, B>,
+    offset: usize,
+) -> Result<T, GuestMemoryError> {
+    Bytes::read_obj(slice, offset).map_err(Into::into)
+}
+
+/// Write a `T` at `offset` within an already-acquired ring slice. See [`read_obj_at`].
+#[inline]
+pub fn write_obj_at<T: ByteValued, B: BitmapSlice>(
+    slice: &VolatileSlice<'_, B>,
+    val: T,
+    offset: usize,
+) -> Result<(), GuestMemoryError> {
+    Bytes::write_obj(slice, val, offset).map_err(Into::into)
 }
 
 /// Errors associated with dumping guest memory to file.

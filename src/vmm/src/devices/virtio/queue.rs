@@ -10,8 +10,14 @@ use std::sync::atomic::{Ordering, fence};
 
 use crate::logger::error;
 use crate::vstate::memory::{
-    Address, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap, MemoryRegionCache,
+    Address, AtomicBitmap, BS, ByteValued, Bytes, GuestAddress, GuestMemory, GuestMemoryMmap,
+    MemoryRegionCache, read_obj_at,
 };
+
+/// A `VolatileSlice` covering one whole ring, acquired once per operation and
+/// indexed within (crosvm-style). Borrows the region, so it is a stack local,
+/// nothing raw is stored on `Queue`, hence no `unsafe impl Send`.
+type RingSlice<'a> = vm_memory::VolatileSlice<'a, BS<'a, Option<AtomicBitmap>>>;
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -387,6 +393,19 @@ impl Queue {
         self.avail().read_obj::<u16>(4 + 2 * index).unwrap()
     }
 
+    /// `avail.idx` read from an already-acquired avail-ring slice.
+    #[inline(always)]
+    fn avail_ring_idx_get_from(slice: &RingSlice) -> u16 {
+        read_obj_at::<u16, _>(slice, 2).unwrap()
+    }
+
+    /// `avail.ring[index]` read from an already-acquired avail-ring slice
+    /// (crosvm-style: one `get_slice` per `pop()` shared across the idx + ring reads).
+    #[inline(always)]
+    fn avail_ring_ring_get_from(slice: &RingSlice, index: usize) -> u16 {
+        read_obj_at::<u16, _>(slice, 4 + 2 * index).unwrap()
+    }
+
     #[inline(always)]
     pub fn avail_ring_used_event_get(&self) -> u16 {
         self.avail()
@@ -442,25 +461,57 @@ impl Queue {
     /// the error to the user (e.g. loading a corrupt snapshot file), and hence cannot panic on its
     /// own.
     pub fn pop(&mut self) -> Result<Option<DescriptorChain>, InvalidAvailIdx> {
-        let len = self.len();
-        // The number of descriptor chain heads to process should always
-        // be smaller or equal to the queue size, as the driver should
-        // never ask the VMM to process a available ring entry more than
-        // once. Checking and reporting such incorrect driver behavior
-        // can prevent potential hanging and Denial-of-Service from
-        // happening on the VMM side.
-        if self.size < len {
-            return Err(InvalidAvailIdx {
-                queue_size: self.size,
-                reported_len: len,
-            });
-        }
+        // crosvm-style amortization: acquire the avail-ring slice ONCE and read
+        // both avail fields this pop needs from it (avail.idx for the length
+        // check + avail.ring[next_avail] for the head index), instead of a fresh
+        // get_slice per field. We read both out and drop the slice before mutating
+        // self, so there is no borrow conflict and nothing raw is retained.
+        // Falls back to the per-field path if the (init-validated) slice can't be
+        // built; behaviour and the per-access bounds check are unchanged.
+        let (len, desc_index) = match self.avail().slice() {
+            Ok(avail_slice) => {
+                // This fence ensures all subsequent reads see the updated driver writes.
+                fence(Ordering::Acquire);
+                let idx = Self::avail_ring_idx_get_from(&avail_slice);
+                let len = (Wrapping(idx) - self.next_avail).0;
+                if self.size < len {
+                    return Err(InvalidAvailIdx {
+                        queue_size: self.size,
+                        reported_len: len,
+                    });
+                }
+                if len == 0 {
+                    return Ok(None);
+                }
+                let ring_pos = self.next_avail.0 % self.size;
+                let desc_index =
+                    Self::avail_ring_ring_get_from(&avail_slice, usize::from(ring_pos));
+                (len, desc_index)
+            }
+            Err(_) => {
+                fence(Ordering::Acquire);
+                let len = self.len();
+                if self.size < len {
+                    return Err(InvalidAvailIdx {
+                        queue_size: self.size,
+                        reported_len: len,
+                    });
+                }
+                if len == 0 {
+                    return Ok(None);
+                }
+                let ring_pos = self.next_avail.0 % self.size;
+                (len, self.avail_ring_ring_get(usize::from(ring_pos)))
+            }
+        };
+        let _ = len;
 
-        if len == 0 {
-            return Ok(None);
-        }
-
-        Ok(self.pop_unchecked())
+        Ok(
+            DescriptorChain::checked_new(self.desc(), self.desc_table_address, self.size, desc_index)
+                .inspect(|_| {
+                    self.next_avail += Wrapping(1);
+                }),
+        )
     }
 
     /// Try to pop the first available descriptor chain from the avail ring.
@@ -505,7 +556,14 @@ impl Queue {
         // descriptor index, with a twist: we always only increment `self.next_avail`, so the
         // actual position will be `self.next_avail % self.size`.
         let idx = self.next_avail.0 % self.size;
-        let desc_index = self.avail_ring_ring_get(usize::from(idx));
+        // Acquire the avail-ring slice ONCE for this pop instead of a fresh
+        // get_slice per field (crosvm-style). Fall back to the per-field path if
+        // the (already-validated-at-init) slice can't be built, keeps behaviour
+        // identical on the error path.
+        let desc_index = match self.avail().slice() {
+            Ok(avail_slice) => Self::avail_ring_ring_get_from(&avail_slice, usize::from(idx)),
+            Err(_) => self.avail_ring_ring_get(usize::from(idx)),
+        };
 
         DescriptorChain::checked_new(self.desc(), self.desc_table_address, self.size, desc_index)
             .inspect(|_| {
@@ -1206,8 +1264,11 @@ mod tests {
 
         assert!(vq.end().0 < 0x1000);
 
+        let desc_table_size = 16 * std::mem::size_of::<Descriptor>();
+        let desc_cache = MemoryRegionCache::new(m, q.desc_table_address, desc_table_size).unwrap();
+
         // index >= queue_size
-        assert!(DescriptorChain::checked_new(m, q.desc_table_address, 16, 16).is_none());
+        assert!(DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 16).is_none());
 
         // Let's create an invalid chain.
         {
@@ -1218,7 +1279,7 @@ mod tests {
             // .. but the index of the next descriptor is too large
             vq.dtable[0].next.set(16);
 
-            assert!(DescriptorChain::checked_new(m, q.desc_table_address, 16, 0).is_none());
+            assert!(DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 0).is_none());
         }
 
         // Finally, let's test an ok chain.
@@ -1226,7 +1287,7 @@ mod tests {
             vq.dtable[0].next.set(1);
             vq.dtable[1].set(0x2000, 0x1000, 0, 0);
 
-            let c = DescriptorChain::checked_new(m, q.desc_table_address, 16, 0).unwrap();
+            let c = DescriptorChain::checked_new(&desc_cache, q.desc_table_address, 16, 0).unwrap();
 
             assert_eq!(c.desc_table, q.desc_table_address);
             assert_eq!(c.queue_size, 16);

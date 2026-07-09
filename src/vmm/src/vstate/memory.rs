@@ -74,13 +74,14 @@ impl MemoryRegionCache {
     }
 
     /// Read a `T` at the given byte offset within the cached range.
+    ///
+    /// The region is resolved once in `new()`, so this reads through the region's
+    /// bounds-checked `Bytes::read_obj` directly (no per-access `find_region`, and no
+    /// redundant `get_slice` layer on top of the region read).
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::read_obj(&slice, 0).map_err(Into::into))
+        Bytes::read_obj(self.region.as_ref(), addr).map_err(Into::into)
     }
 
     /// Write a `T` at the given byte offset within the cached range.
@@ -91,10 +92,7 @@ impl MemoryRegionCache {
         offset: usize,
     ) -> Result<(), GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
+        Bytes::write_obj(self.region.as_ref(), val, addr).map_err(Into::into)
     }
 }
 

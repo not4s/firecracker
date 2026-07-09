@@ -272,10 +272,16 @@ impl KvmVcpu {
 
         // KVM_REG_ARM64_SVE_VLS needs to be skipped after vcpu is finalized.
         // If it is present it is handled in the code above.
+        //
+        // ID_AA64ISAR1_EL1 is skipped because some host kernels (e.g. Amazon
+        // Linux 6.1 on Graviton5) reject every KVM_SET_ONE_REG write to it,
+        // including the exact value KVM itself returned on KVM_GET_ONE_REG and
+        // including zero. KVM already establishes the correct sanitised value at
+        // vcpu init, so re-writing it on restore is a no-op we can safely omit.
         for reg in state
             .regs
             .iter()
-            .filter(|reg| reg.id != KVM_REG_ARM64_SVE_VLS)
+            .filter(|reg| reg.id != KVM_REG_ARM64_SVE_VLS && reg.id != ID_AA64ISAR1_EL1)
         {
             self.set_register(reg).map_err(KvmVcpuError::RestoreState)?;
         }

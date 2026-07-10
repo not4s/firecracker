@@ -74,27 +74,46 @@ impl MemoryRegionCache {
     }
 
     /// Read a `T` at the given byte offset within the cached range.
+    ///
+    /// `get_slice` performs the single bounds check and hands back a slice sized exactly to
+    /// `T`. We then read `T` directly from that slice's pointer, rather than routing through
+    /// the generic `Bytes::read_obj`, which would re-validate the range and build a second
+    /// sub-slice for a value already known to fit.
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
+        let slice = self
+            .region
             .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::read_obj(&slice, 0).map_err(Into::into))
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        let guard = slice.ptr_guard();
+        // SAFETY: `get_slice` validated `[addr, addr+size_of::<T>())` is within the region and
+        // returned a slice of exactly that length, so the pointer is valid for a `T`-sized read.
+        // Ring fields are naturally aligned (validated when the queue is initialized).
+        Ok(unsafe { (guard.as_ptr() as *const T).read_volatile() })
     }
 
-    /// Write a `T` at the given byte offset within the cached range.
+    /// Write a `T` at the given byte offset within the cached range. See `read_obj`.
     #[inline]
     pub fn write_obj<T: ByteValued>(
         &self,
         val: T,
         offset: usize,
     ) -> Result<(), GuestMemoryError> {
+        let size = std::mem::size_of::<T>();
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
+        let slice = self
+            .region
+            .get_slice(addr, size)
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        let guard = slice.ptr_guard_mut();
+        // SAFETY: `get_slice` validated `[addr, addr+size)` is in-region and returned a slice
+        // of exactly that length; ring fields are naturally aligned (validated at queue init).
+        unsafe { (guard.as_ptr() as *mut T).write_volatile(val) };
+        // A raw write through the guard pointer is not tracked by the dirty bitmap, so mark
+        // it explicitly (equivalent to what the generic write path does internally).
+        slice.bitmap().mark_dirty(0, size);
+        Ok(())
     }
 }
 

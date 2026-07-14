@@ -20,9 +20,7 @@ pub use vm_memory::{
     Address, ByteValued, Bytes, FileOffset, GuestAddress, GuestMemory, GuestMemoryRegion,
     GuestUsize, MemoryRegionAddress, MmapRegion, address,
 };
-use vm_memory::{
-    GuestMemoryError, GuestMemoryRegionBytes, VolatileMemory, VolatileSlice, WriteVolatile,
-};
+use vm_memory::{GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile};
 
 use crate::DirtyBitmap;
 use crate::arch::host_page_size;
@@ -38,21 +36,34 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 /// Type of GuestMmapRegion.
 pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 
+/// A `#[repr(C, packed)]` wrapper used to load/store a `T` through a raw pointer without an
+/// alignment requirement: `align_of::<Packed<T>>()` is 1, so `read_volatile`/`write_volatile`
+/// on a `*Packed<T>` are defined at any address, and the copy in/out uses an aligned local.
+#[repr(C, packed)]
+struct Packed<T>(T);
+
 /// A cached translation for a contiguous range of guest memory within a single region.
-/// Analogous to QEMU's MemoryRegionCache. Created once at setup time, reused for
-/// every access to that range. Skips find_region and to_region_addr on each access.
+/// The host base pointer is resolved once in `new()` and reused for each access.
 #[derive(Clone, Debug)]
 pub struct MemoryRegionCache {
-    /// Keeps the region (and its underlying mmap) alive.
+    /// Keeps the region (and its underlying mmap) alive so `base` stays valid. Held for its
+    /// `Drop` guard only; the pointer is used directly, so the field is never read.
+    #[allow(dead_code)]
     region: Arc<GuestRegionMmapExt>,
-    /// Pre-computed offset of the range's start within the region.
-    region_offset: usize,
-    /// Validated length of the cached range in bytes.
+    /// Host base pointer of the range, resolved once in `new()` from a bounds-checked slice.
+    base: *mut u8,
+    /// Length of the cached range in bytes.
     len: usize,
 }
 
+// SAFETY: `base` points into the mmap owned by `region`, which the `Arc` keeps alive for the
+// lifetime of the cache. Accesses are volatile and the cache is only used by the owning
+// single-threaded Queue, which is itself Send but not Sync.
+unsafe impl Send for MemoryRegionCache {}
+
 impl MemoryRegionCache {
-    /// Translate `addr..addr+len` once, validate it fits in a single region.
+    /// Translate `addr..addr+len`, validate it fits in a single region, and cache the
+    /// resolved host base pointer.
     pub fn new(
         mem: &GuestMemoryMmap,
         addr: GuestAddress,
@@ -64,47 +75,44 @@ impl MemoryRegionCache {
         let region_addr = region
             .to_region_addr(addr)
             .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
-        region
-            .checked_offset(region_addr, len.saturating_sub(1))
-            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        // Bounds-check the whole range and take its base pointer.
+        let slice = region
+            .get_slice(region_addr, len)
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(addr))?;
+        // Mark the whole range dirty up front; writes go through the raw pointer and do not
+        // update the bitmap themselves.
+        slice.bitmap().mark_dirty(0, len);
+        let base = slice.ptr_guard_mut().as_ptr();
 
-        Ok(Self {
-            region,
-            region_offset: region_addr.raw_value() as usize,
-            len,
-        })
+        Ok(Self { region, base, len })
     }
 
-    /// Read a `T` at the given byte offset within the cached range.
+    /// Read a `T` at `offset` bytes into the range.
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
-        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        let slice = self
-            .region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        let vref = slice
-            .get_ref::<T>(0)
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        Ok(vref.load())
+        let size = std::mem::size_of::<T>();
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
+            return Err(GuestMemoryError::InvalidGuestAddress(GuestAddress(0)));
+        }
+        // SAFETY: the check above keeps `[offset, offset+size)` within the range `new()`
+        // validated; `Packed<T>` is 1-aligned so the volatile read is defined at any address.
+        Ok(unsafe { (self.base.add(offset) as *const Packed<T>).read_volatile().0 })
     }
 
-    /// Write a `T` at the given byte offset within the cached range.
+    /// Write a `T` at `offset` bytes into the range. The range is marked dirty in `new()`.
     #[inline]
     pub fn write_obj<T: ByteValued>(
         &self,
         val: T,
         offset: usize,
     ) -> Result<(), GuestMemoryError> {
-        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        let slice = self
-            .region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        let vref = slice
-            .get_ref::<T>(0)
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        vref.store(val);
+        let size = std::mem::size_of::<T>();
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
+            return Err(GuestMemoryError::InvalidGuestAddress(GuestAddress(0)));
+        }
+        // SAFETY: as in `read_obj` the target is within the validated range; `Packed<T>` is
+        // 1-aligned so the volatile write is defined at any address.
+        unsafe { (self.base.add(offset) as *mut Packed<T>).write_volatile(Packed(val)) };
         Ok(())
     }
 }

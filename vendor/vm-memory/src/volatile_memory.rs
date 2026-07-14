@@ -124,6 +124,7 @@ pub trait VolatileMemory {
     }
 
     /// Gets a `VolatileRef` at `offset`.
+    #[inline]
     fn get_ref<T: ByteValued>(&self, offset: usize) -> Result<VolatileRef<T, BS<Self::B>>> {
         let slice = self.get_slice(offset, size_of::<T>())?;
 
@@ -288,6 +289,7 @@ pub trait VolatileMemory {
     ///
     /// assert_eq!(slice.compute_end_offset(3, 0).unwrap(), 3);
     /// ```
+    #[inline]
     fn compute_end_offset(&self, base: usize, offset: usize) -> Result<usize> {
         let mem_end = compute_offset(base, offset)?;
         if mem_end > self.len() {
@@ -491,6 +493,7 @@ impl<'a, B: BitmapSlice> VolatileSlice<'a, B> {
     ///
     /// The returned subslice is a copy of this slice with the address increased by `offset` bytes
     /// and the size set to `count` bytes.
+    #[inline]
     pub fn subslice(&self, offset: usize, count: usize) -> Result<Self> {
         let _ = self.compute_end_offset(offset, count)?;
 
@@ -847,6 +850,7 @@ impl<B: BitmapSlice> VolatileMemory for VolatileSlice<'_, B> {
         self.size
     }
 
+    #[inline]
     fn get_slice(&self, offset: usize, count: usize) -> Result<VolatileSlice<B>> {
         self.subslice(offset, count)
     }

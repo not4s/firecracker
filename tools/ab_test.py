@@ -294,7 +294,9 @@ def analyze_data(
     Analyzes the A/B-test data produced by `collect_data`, by performing regression tests
     as described this script's doc-comment.
 
-    Returns the list of error messages (empty if the test passes).
+    Returns a list of (key, message) tuples for each flagged regression, where key is
+    the (dimension_set, metric) pair. Empty if the test passes. The key lets callers
+    tally reproductions of the same regression across independent runs.
     """
     assert set(data_a.keys()) == set(
         data_b.keys()
@@ -408,7 +410,7 @@ def analyze_data(
                 f"characteristics did not change across the tested commits, has a probability of {result.pvalue:.2%}. "
                 f"Tested Dimensions:\n{json.dumps({k: v for k, v in dimension_set if k not in do_not_print_list}, indent=2, sort_keys=True)}"
             )
-            error_messages.append(msg)
+            error_messages.append(((dimension_set, metric), msg))
 
     return error_messages
 
@@ -435,46 +437,97 @@ def ab_performance_test(
     strength_abs_thresh: Threshold,
     noise_threshold: Threshold,
     max_iterations=1,
+    reproduction_threshold=None,
 ):
     """Does an A/B-test of the specified test with the given firecracker/jailer binaries.
 
-    Retries up to max_iterations times, accumulating data only for dimensions
-    that are still failing, to reduce noise-induced false positives."""
+    Runs up to `max_iterations` INDEPENDENT A/B iterations and analyzes each on its
+    own (no cross-iteration sample accumulation). A regression is reported only if the
+    same (dimension, metric) is flagged in at least `reproduction_threshold` of the
+    iterations that ran.
 
-    data_a = {}
-    data_b = {}
-    error_messages = []
+    Rationale: all samples within a single iteration share one host / boot / window, so
+    the per-iteration permutation test is over-confident about run-to-run measurement
+    variance (pseudo-replication) and fires on noise. Genuine regressions reproduce
+    across independent iterations; noise wanders to a different dimension each time.
+    Requiring reproduction filters the noise without lowering per-iteration sensitivity.
+
+    The first iteration is always run; if it is clean, we return immediately (cheap
+    green path). We only spend the extra iterations to confirm a suspected regression.
+    """
+
+    if reproduction_threshold is None:
+        # Default: require a strict majority of the iterations to agree.
+        reproduction_threshold = max_iterations // 2 + 1
+    assert (
+        1 <= reproduction_threshold <= max_iterations
+    ), "reproduction_threshold must be between 1 and max_iterations"
+
+    fire_counts = defaultdict(int)
+    messages = {}
+    iterations_run = 0
 
     for i in range(max_iterations):
         print(f"\n=== Iteration {i + 1}/{max_iterations} ===")
-        # Changing the order or A and B executions across iterations, to avoid fluctuations caused by execution order
+        # Change the order of A and B executions across iterations, to avoid
+        # fluctuations caused by execution order.
         if i % 2 == 0:
-            new_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
-            new_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
+            data_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
+            data_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
         else:
-            new_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
-            new_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
-        merge_data(data_a, new_a)
-        merge_data(data_b, new_b)
+            data_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
+            data_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
 
-        error_messages = analyze_data(
+        # Analyze THIS iteration standalone (no accumulation across iterations).
+        iteration_failures = analyze_data(
             data_a,
             data_b,
             p_thresh,
             strength_abs_thresh,
             noise_threshold,
         )
+        iterations_run += 1
 
-        if not error_messages:
+        for key, msg in iteration_failures:
+            fire_counts[key] += 1
+            messages[key] = msg
+
+        # Cheap green path: a clean first iteration means nothing to confirm.
+        if i == 0 and not iteration_failures:
             print("No regressions detected!")
             return
 
-        if i < max_iterations - 1:
+        # A regression can only be confirmed once it reproduces in enough iterations.
+        confirmed = [k for k, c in fire_counts.items() if c >= reproduction_threshold]
+        if confirmed:
             print(
-                f"{len(error_messages)} regression(s) detected, retrying to collect more data..."
+                f"{len(confirmed)} regression(s) reproduced in "
+                f">={reproduction_threshold} iterations."
             )
 
-    assert not error_messages, "\n" + "\n".join(error_messages)
+        print(
+            f"Fire tally after {iterations_run} iteration(s): "
+            + ", ".join(
+                f"{c}x {dict(k[0]).get('instance','?')}/{k[1]}"
+                for k, c in fire_counts.items()
+            )
+        )
+
+    # Fail only for regressions that reproduced in >= reproduction_threshold iterations.
+    confirmed_messages = [
+        messages[k] for k, c in fire_counts.items() if c >= reproduction_threshold
+    ]
+    non_reproducing = {
+        k: c for k, c in fire_counts.items() if c < reproduction_threshold
+    }
+    if non_reproducing:
+        print(
+            f"\nIgnoring {len(non_reproducing)} non-reproducing (likely noise) firing(s) "
+            f"that appeared in fewer than {reproduction_threshold}/{iterations_run} iterations."
+        )
+
+    assert not confirmed_messages, "\n" + "\n".join(confirmed_messages)
+    print("No reproducible regressions detected!")
 
 
 def main():
@@ -522,9 +575,15 @@ def main():
     )
     run_parser.add_argument(
         "--max-iterations",
-        help="Maximum number of A/B iterations. Retries only if regressions are detected, accumulating more data to reduce false positives.",
+        help="Number of independent A/B iterations to run. A regression is reported only if it reproduces in at least --reproduction-threshold of them. A clean first iteration returns immediately.",
         type=int,
         default=1,
+    )
+    run_parser.add_argument(
+        "--reproduction-threshold",
+        help="Minimum number of iterations in which the same (dimension, metric) must be flagged for it to count as a real regression. Defaults to a strict majority of --max-iterations. Filters run-to-run measurement noise, which does not reproduce on the same dimension.",
+        type=int,
+        default=None,
     )
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -576,6 +635,7 @@ def main():
             strength_abs_thresh,
             noise_threshold,
             max_iterations=args.max_iterations,
+            reproduction_threshold=args.reproduction_threshold,
         )
         print(f"Total A/B test took {time.perf_counter() - t0:.2f}s")
     else:
@@ -585,7 +645,7 @@ def main():
         print(f"Data loading took {time.perf_counter() - t0:.2f}s")
 
         t0 = time.perf_counter()
-        error_messages = analyze_data(
+        failures = analyze_data(
             data_a,
             data_b,
             p_thresh,
@@ -593,6 +653,9 @@ def main():
             noise_threshold,
         )
         print(f"Analysis took {time.perf_counter() - t0:.2f}s")
+        # `analyze` operates on a single pair of pre-collected runs, so there is no
+        # cross-run reproduction to check here; report every flagged regression.
+        error_messages = [msg for _key, msg in failures]
         assert not error_messages, "\n" + "\n".join(error_messages)
         print("No regressions detected!")
 

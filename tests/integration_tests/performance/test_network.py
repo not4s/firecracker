@@ -65,7 +65,15 @@ def test_network_latency(network_microvm, metrics):
     Test network latency by sending pings from the guest to the host.
     """
 
+    # Number of latency samples to keep (after warm-up).
     target_datapoints = 500
+    # Drop the first few RTTs of each ping burst: the initial packets pay for
+    # ARP resolution and cold CPU/route caches and are up to ~50x slower than
+    # the steady-state microsecond RTT on metal. A single such outlier shifts
+    # the mean by ~10%, and if the A and B sides warm up differently this trips
+    # the A/B statistical gate as a false positive. Mirrors the iperf throughput
+    # test in this file, which already omits a warm-up window (warmup_sec=5).
+    warmup_datapoints = 10
     delay = 0.0
 
     metrics.set_dimensions(
@@ -82,9 +90,12 @@ def test_network_latency(network_microvm, metrics):
     collected_datapoints = 0
     while collected_datapoints < target_datapoints:
         _, ping_output, _ = network_microvm.ssh.check_output(
-            f"ping -c {target_datapoints} -i {delay} {host_ip}"
+            f"ping -c {target_datapoints + warmup_datapoints} -i {delay} {host_ip}"
         )
-        for sample in consume_ping_output(ping_output):
+        for i, sample in enumerate(consume_ping_output(ping_output)):
+            if i < warmup_datapoints:
+                # discard per-burst warm-up samples (see comment above)
+                continue
             collected_datapoints += 1
             metrics.put_metric("ping_latency", sample, "Milliseconds")
 

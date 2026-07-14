@@ -13,6 +13,11 @@ DEFAULT_IPV4 = "169.254.169.254"
 
 # Number of iterations for performance measurements
 ITERATIONS = 500
+# Discard the first few iterations as warm-up: the initial curl requests pay for
+# TCP/connection setup and cold caches and are markedly slower than steady state.
+# If the A and B sides of an A/B run warm up differently this shifts the mean and
+# trips the statistical gate as a false positive. Mirrors the network latency test.
+WARMUP_ITERATIONS = 10
 
 
 def parse_curl_timing(prefix: str, timing_line: str):
@@ -76,7 +81,7 @@ def test_mmds_token(mmds_microvm, metrics):
     #   ---
     # noinspection HttpUrlsUsage
     batch_cmd = (
-        f"for i in $(seq 1 {ITERATIONS}); do "
+        f"for i in $(seq 1 {ITERATIONS + WARMUP_ITERATIONS}); do "
         f"curl -m 2 -s -w 'token_generation_time:%{{time_total}}\\n' "
         f"-X PUT -H 'X-metadata-token-ttl-seconds: 60' "
         f"-o /tmp/mmds_token "
@@ -98,7 +103,10 @@ def test_mmds_token(mmds_microvm, metrics):
     iterations = stdout.split("---\n")
     assert iterations[-1] == ""
     iterations = iterations[:-1]
-    assert len(iterations) == ITERATIONS
+    assert len(iterations) == ITERATIONS + WARMUP_ITERATIONS
+
+    # Drop the warm-up iterations so only steady-state samples are measured.
+    iterations = iterations[WARMUP_ITERATIONS:]
 
     for block in iterations:
         lines = block.strip().split("\n")

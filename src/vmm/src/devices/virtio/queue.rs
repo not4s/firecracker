@@ -176,17 +176,27 @@ impl DescriptorChain {
     }
 
     /// Gets the next descriptor in this descriptor chain, if there is one.
-    /// Uses a cached region translation for the descriptor table read.
-    pub fn next_descriptor_cached(&self, desc_cache: &MemoryRegionCache) -> Option<Self> {
-        if self.has_next() {
-            DescriptorChain::checked_new(desc_cache, self.desc_table, self.queue_size, self.next)
-                .map(|mut c| {
-                    c.ttl = self.ttl - 1;
-                    c
-                })
-        } else {
-            None
+    /// Populates `desc_cache` from the descriptor table on first use.
+    pub fn next_descriptor_cached(
+        &self,
+        mem: &GuestMemoryMmap,
+        desc_cache: &mut Option<MemoryRegionCache>,
+    ) -> Option<Self> {
+        if !self.has_next() {
+            return None;
         }
+        let desc_cache = match desc_cache {
+            Some(cache) => cache,
+            None => desc_cache.insert(
+                MemoryRegionCache::new(mem, self.desc_table, self.desc_table_size()).ok()?,
+            ),
+        };
+        DescriptorChain::checked_new(desc_cache, self.desc_table, self.queue_size, self.next).map(
+            |mut c| {
+                c.ttl = self.ttl - 1;
+                c
+            },
+        )
     }
 
     /// Gets the next descriptor in this descriptor chain, if there is one.

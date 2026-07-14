@@ -391,6 +391,7 @@ impl<B: Bitmap> VolatileMemory for MmapRegion<B> {
         self.size
     }
 
+    #[inline]
     fn get_slice(
         &self,
         offset: usize,

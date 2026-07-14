@@ -146,6 +146,7 @@ impl<B: Bitmap> GuestMemoryRegion for GuestRegionMmap<B> {
         self.mapping.file_offset()
     }
 
+    #[inline]
     fn get_slice(
         &self,
         offset: MemoryRegionAddress,

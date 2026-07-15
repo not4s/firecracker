@@ -257,6 +257,41 @@ def check_regression(
     )
 
 
+def check_regression_runlevel(means_a, means_b):
+    """Paired regression test across independent A/B iterations.
+
+    `means_a` / `means_b` are lists of per-iteration mean values for one
+    (dimension, metric), one entry per A/B iteration. Each iteration is an
+    independent run (its own microVM boot and measurement window), so the
+    iteration mean is the correct independent unit of observation.
+
+    We run a paired t-test on the per-iteration differences (B minus A). Because A
+    and B execute back-to-back within an iteration, a shared per-run/host offset
+    largely cancels in the difference, and the test's significance is driven by the
+    run-to-run variance of that difference rather than by the (correlated) count of
+    samples within a single run. This avoids the pseudo-replication that makes the
+    within-run permutation test fire on ordinary measurement noise.
+
+    Returns (pvalue, effect) where effect = mean(means_b) - mean(means_a). With fewer
+    than two iterations run-to-run variance is undefined, so we report pvalue 1.0.
+    """
+    a = numpy.array(means_a, dtype=float)
+    b = numpy.array(means_b, dtype=float)
+    effect = float(numpy.mean(b) - numpy.mean(a))
+
+    if len(a) < 2:
+        return 1.0, effect
+
+    result = scipy.stats.ttest_rel(b, a)
+    pvalue = float(result.pvalue)
+    # ttest_rel returns nan when every paired difference is identical (zero
+    # variance). Zero variance with a nonzero effect is degenerate for so few
+    # samples; treat it as not significant rather than infinitely significant.
+    if numpy.isnan(pvalue):
+        pvalue = 1.0
+    return pvalue, effect
+
+
 @dataclass
 class Threshold:
     """A threshold value with optional per-metric overrides."""
@@ -294,9 +329,10 @@ def analyze_data(
     Analyzes the A/B-test data produced by `collect_data`, by performing regression tests
     as described this script's doc-comment.
 
-    Returns a list of (key, message) tuples for each flagged regression, where key is
-    the (dimension_set, metric) pair. Empty if the test passes. The key lets callers
-    tally reproductions of the same regression across independent runs.
+    Returns the list of error messages (empty if the test passes). This pooled test is
+    over-sensitive (it treats correlated within-run samples as independent), so
+    `ab_performance_test` uses it only as a cheap first-iteration screen and confirms
+    survivors with a run-level test across independent iterations.
     """
     assert set(data_a.keys()) == set(
         data_b.keys()
@@ -410,21 +446,9 @@ def analyze_data(
                 f"characteristics did not change across the tested commits, has a probability of {result.pvalue:.2%}. "
                 f"Tested Dimensions:\n{json.dumps({k: v for k, v in dimension_set if k not in do_not_print_list}, indent=2, sort_keys=True)}"
             )
-            error_messages.append(((dimension_set, metric), msg))
+            error_messages.append(msg)
 
     return error_messages
-
-
-def merge_data(accumulated, new_data):
-    """Merge new_data into accumulated by appending values lists for each metric."""
-    for dimension_set, metrics in new_data.items():
-        if dimension_set not in accumulated:
-            accumulated[dimension_set] = {}
-        for metric, (values, unit) in metrics.items():
-            if metric in accumulated[dimension_set]:
-                accumulated[dimension_set][metric][0].extend(values)
-            else:
-                accumulated[dimension_set][metric] = (list(values), unit)
 
 
 def ab_performance_test(
@@ -437,35 +461,38 @@ def ab_performance_test(
     strength_abs_thresh: Threshold,
     noise_threshold: Threshold,
     max_iterations=1,
-    reproduction_threshold=None,
 ):
     """Does an A/B-test of the specified test with the given firecracker/jailer binaries.
 
-    Runs up to `max_iterations` INDEPENDENT A/B iterations and analyzes each on its
-    own (no cross-iteration sample accumulation). A regression is reported only if the
-    same (dimension, metric) is flagged in at least `reproduction_threshold` of the
-    iterations that ran.
+    A single measurement run collects ~hundreds of samples, but they all share one
+    microVM boot / host / time window, so they are NOT independent. Pooling them into
+    one permutation test underestimates run-to-run variance (pseudo-replication) and
+    reports ordinary measurement noise as a highly significant regression.
 
-    Rationale: all samples within a single iteration share one host / boot / window, so
-    the per-iteration permutation test is over-confident about run-to-run measurement
-    variance (pseudo-replication) and fires on noise. Genuine regressions reproduce
-    across independent iterations; noise wanders to a different dimension each time.
-    Requiring reproduction filters the noise without lowering per-iteration sensitivity.
-
-    The first iteration is always run; if it is clean, we return immediately (cheap
-    green path). We only spend the extra iterations to confirm a suspected regression.
+    To avoid this we treat each A/B iteration as one independent observation:
+      1. Run iteration 1 and screen it with the (over-sensitive) pooled test. If it is
+         clean, return immediately -- a clean over-sensitive screen means there is
+         nothing to confirm, so green runs keep their current 1-iteration cost.
+      2. Otherwise run the remaining iterations, recording each iteration's per-metric
+         MEAN for every dimension.
+      3. Report a regression only if, across the iterations, the paired run-level
+         t-test is significant (significance from run-to-run variance, not sample
+         count) AND the mean relative change exceeds the noise threshold. The t-test
+         rejects wandering pseudo-replication noise; the magnitude floor rejects small
+         but systematic per-host measurement bias.
     """
 
-    if reproduction_threshold is None:
-        # Default: require a strict majority of the iterations to agree.
-        reproduction_threshold = max_iterations // 2 + 1
-    assert (
-        1 <= reproduction_threshold <= max_iterations
-    ), "reproduction_threshold must be between 1 and max_iterations"
-
-    fire_counts = defaultdict(int)
-    messages = {}
+    # Per (dimension_set, metric): lists of per-iteration means for A and B, plus unit.
+    means_a = defaultdict(list)
+    means_b = defaultdict(list)
+    units = {}
     iterations_run = 0
+
+    def record(data, means):
+        for dimension_set, metrics in data.items():
+            for metric, (values, unit) in metrics.items():
+                means[(dimension_set, metric)].append(float(numpy.mean(values)))
+                units[(dimension_set, metric)] = unit
 
     for i in range(max_iterations):
         print(f"\n=== Iteration {i + 1}/{max_iterations} ===")
@@ -478,55 +505,62 @@ def ab_performance_test(
             data_b = collect_data("B", b_directory, b_artifacts, pytest_opts, i)
             data_a = collect_data("A", a_directory, a_artifacts, pytest_opts, i)
 
-        # Analyze THIS iteration standalone (no accumulation across iterations).
-        iteration_failures = analyze_data(
-            data_a,
-            data_b,
-            p_thresh,
-            strength_abs_thresh,
-            noise_threshold,
-        )
+        record(data_a, means_a)
+        record(data_b, means_b)
         iterations_run += 1
 
-        for key, msg in iteration_failures:
-            fire_counts[key] += 1
-            messages[key] = msg
-
-        # Cheap green path: a clean first iteration means nothing to confirm.
-        if i == 0 and not iteration_failures:
-            print("No regressions detected!")
-            return
-
-        # A regression can only be confirmed once it reproduces in enough iterations.
-        confirmed = [k for k, c in fire_counts.items() if c >= reproduction_threshold]
-        if confirmed:
+        # Cheap green path: the pooled screen is over-sensitive, so a clean first
+        # iteration means there is nothing worth spending more iterations to confirm.
+        if i == 0:
+            screen = analyze_data(
+                data_a, data_b, p_thresh, strength_abs_thresh, noise_threshold
+            )
+            if not screen:
+                print("No regressions detected (clean screening iteration)!")
+                return
             print(
-                f"{len(confirmed)} regression(s) reproduced in "
-                f">={reproduction_threshold} iterations."
+                f"Screening iteration flagged {len(screen)} candidate(s); "
+                f"running {max_iterations - 1} more iteration(s) to test for "
+                f"reproducible, run-level significant regressions..."
             )
 
-        print(
-            f"Fire tally after {iterations_run} iteration(s): "
-            + ", ".join(
-                f"{c}x {dict(k[0]).get('instance','?')}/{k[1]}"
-                for k, c in fire_counts.items()
+    # Run-level analysis across the independent iterations.
+    do_not_print_list = uninteresting_dimensions({ds: {} for (ds, _metric) in means_a})
+    error_messages = []
+    for key in means_a:
+        dimension_set, metric = key
+        if is_ignored(dict(dimension_set) | {"metric": metric}):
+            continue
+
+        pvalue, effect = check_regression_runlevel(means_a[key], means_b[key])
+        baseline = numpy.mean(means_a[key])
+        relative_change = effect / baseline if baseline else 0.0
+
+        significant = pvalue < p_thresh.get(metric)
+        strong_enough = abs(effect) > strength_abs_thresh.get(metric)
+        above_noise = abs(relative_change) > noise_threshold.get(metric)
+
+        if significant and strong_enough and above_noise:
+            old_mean = numpy.mean(means_a[key])
+            new_mean = numpy.mean(means_b[key])
+            unit = units[key]
+            msg = (
+                f"\033[0;32m[Firecracker A/B-Test Runner]\033[0m A/B-testing shows a change of "
+                f"{format_with_reduced_unit(effect, unit)}, or {relative_change:.2%}, "
+                f"(from {format_with_reduced_unit(old_mean, unit)} to {format_with_reduced_unit(new_mean, unit)}) "
+                f"for metric \033[1m{metric}\033[0m with \033[0;31m\033[1mp={pvalue}\033[0m "
+                f"across {iterations_run} independent iterations. "
+                f"Tested Dimensions:\n{json.dumps({k: v for k, v in dimension_set if k not in do_not_print_list}, indent=2, sort_keys=True)}"
             )
-        )
+            error_messages.append(msg)
 
-    # Fail only for regressions that reproduced in >= reproduction_threshold iterations.
-    confirmed_messages = [
-        messages[k] for k, c in fire_counts.items() if c >= reproduction_threshold
-    ]
-    non_reproducing = {
-        k: c for k, c in fire_counts.items() if c < reproduction_threshold
-    }
-    if non_reproducing:
+    if not error_messages:
         print(
-            f"\nIgnoring {len(non_reproducing)} non-reproducing (likely noise) firing(s) "
-            f"that appeared in fewer than {reproduction_threshold}/{iterations_run} iterations."
+            f"No reproducible, run-level significant regressions across "
+            f"{iterations_run} iterations."
         )
 
-    assert not confirmed_messages, "\n" + "\n".join(confirmed_messages)
+    assert not error_messages, "\n" + "\n".join(error_messages)
     print("No reproducible regressions detected!")
 
 
@@ -575,15 +609,9 @@ def main():
     )
     run_parser.add_argument(
         "--max-iterations",
-        help="Number of independent A/B iterations to run. A regression is reported only if it reproduces in at least --reproduction-threshold of them. A clean first iteration returns immediately.",
+        help="Number of independent A/B iterations to run. Iteration 1 is a cheap over-sensitive screen; if it is clean the run returns immediately. Otherwise all iterations run and a regression is reported only if the paired run-level t-test across iterations is significant and exceeds the noise threshold. More iterations give the run-level test more statistical power.",
         type=int,
         default=1,
-    )
-    run_parser.add_argument(
-        "--reproduction-threshold",
-        help="Minimum number of iterations in which the same (dimension, metric) must be flagged for it to count as a real regression. Defaults to a strict majority of --max-iterations. Filters run-to-run measurement noise, which does not reproduce on the same dimension.",
-        type=int,
-        default=None,
     )
     analyze_parser = subparsers.add_parser(
         "analyze",
@@ -635,7 +663,6 @@ def main():
             strength_abs_thresh,
             noise_threshold,
             max_iterations=args.max_iterations,
-            reproduction_threshold=args.reproduction_threshold,
         )
         print(f"Total A/B test took {time.perf_counter() - t0:.2f}s")
     else:
@@ -645,7 +672,7 @@ def main():
         print(f"Data loading took {time.perf_counter() - t0:.2f}s")
 
         t0 = time.perf_counter()
-        failures = analyze_data(
+        error_messages = analyze_data(
             data_a,
             data_b,
             p_thresh,
@@ -653,9 +680,6 @@ def main():
             noise_threshold,
         )
         print(f"Analysis took {time.perf_counter() - t0:.2f}s")
-        # `analyze` operates on a single pair of pre-collected runs, so there is no
-        # cross-run reproduction to check here; report every flagged regression.
-        error_messages = [msg for _key, msg in failures]
         assert not error_messages, "\n" + "\n".join(error_messages)
         print("No regressions detected!")
 

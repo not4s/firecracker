@@ -6,6 +6,7 @@ import json
 import re
 from pathlib import Path
 
+import numpy
 import pytest
 
 from framework.artifacts import ACPI_GUEST_KERNELS, pin_guest_kernel
@@ -66,6 +67,9 @@ def test_network_latency(network_microvm, metrics):
     """
 
     target_datapoints = 500
+    # Drop the first few RTTs of each ping burst: ARP resolution and cold caches
+    # make them outliers that inflate the mean without reflecting steady state.
+    warmup_datapoints = 10
     delay = 0.0
 
     metrics.set_dimensions(
@@ -79,14 +83,26 @@ def test_network_latency(network_microvm, metrics):
 
     # ping might return less than the requested datapoints, so we need to iterate multiple times.
     # Note: we're okay with _more_ datapoints than the target
-    collected_datapoints = 0
-    while collected_datapoints < target_datapoints:
+    samples = []
+    while len(samples) < target_datapoints:
         _, ping_output, _ = network_microvm.ssh.check_output(
-            f"ping -c {target_datapoints} -i {delay} {host_ip}"
+            f"ping -c {target_datapoints + warmup_datapoints} -i {delay} {host_ip}"
         )
-        for sample in consume_ping_output(ping_output):
-            collected_datapoints += 1
-            metrics.put_metric("ping_latency", sample, "Milliseconds")
+        burst = list(consume_ping_output(ping_output))
+        samples.extend(burst[warmup_datapoints:])
+
+    for sample in samples:
+        metrics.put_metric("ping_latency", sample, "Milliseconds")
+
+    # Diagnostic: log within-run spread so run-level (between-run) variance can be
+    # separated from per-sample (within-run) jitter when comparing A/B iterations.
+    arr = numpy.array(samples)
+    print(
+        f"[ping-diag] {network_microvm.dimensions.get('instance')} "
+        f"n={len(arr)} mean={arr.mean():.2f} median={numpy.median(arr):.2f} "
+        f"std={arr.std():.2f} cv={arr.std() / arr.mean():.3%} "
+        f"p50={numpy.percentile(arr, 50):.2f} p90={numpy.percentile(arr, 90):.2f}"
+    )
 
 
 @pytest.mark.nonci

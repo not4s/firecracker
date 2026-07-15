@@ -39,7 +39,9 @@ perf_test = {
     },
     "network": {
         "label": "network",
-        "tests": "integration_tests/performance/test_network.py",
+        # Latency-only while iterating on ping variance reduction (throughput is
+        # the ~15min/side cost; exclude it to keep the experiment cheap).
+        "tests": "integration_tests/performance/test_network.py::test_network_latency",
         "devtool_opts": "-c 1-10 -m 0",
         # 2% gate (vs default 5%) so every cell's exact delta prints to the log.
         "ab_opts": "--noise-threshold 0.02",

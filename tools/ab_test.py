@@ -258,22 +258,15 @@ def check_regression(
 
 
 def check_regression_runlevel(means_a, means_b):
-    """Paired regression test across independent A/B iterations.
+    """Paired t-test over per-iteration means (one entry per independent A/B run).
 
-    `means_a` / `means_b` are lists of per-iteration mean values for one
-    (dimension, metric), one entry per A/B iteration. Each iteration is an
-    independent run (its own microVM boot and measurement window), so the
-    iteration mean is the correct independent unit of observation.
+    Each iteration is an independent run, so its mean is the correct unit of
+    observation. Significance comes from the run-to-run variance of the (B - A)
+    difference, not the correlated sample count within one run, avoiding the
+    pseudo-replication that makes the pooled permutation test fire on noise.
 
-    We run a paired t-test on the per-iteration differences (B minus A). Because A
-    and B execute back-to-back within an iteration, a shared per-run/host offset
-    largely cancels in the difference, and the test's significance is driven by the
-    run-to-run variance of that difference rather than by the (correlated) count of
-    samples within a single run. This avoids the pseudo-replication that makes the
-    within-run permutation test fire on ordinary measurement noise.
-
-    Returns (pvalue, effect) where effect = mean(means_b) - mean(means_a). With fewer
-    than two iterations run-to-run variance is undefined, so we report pvalue 1.0.
+    Returns (pvalue, effect = mean(b) - mean(a)); pvalue 1.0 with < 2 iterations
+    (variance undefined) or zero variance.
     """
     a = numpy.array(means_a, dtype=float)
     b = numpy.array(means_b, dtype=float)
@@ -282,12 +275,8 @@ def check_regression_runlevel(means_a, means_b):
     if len(a) < 2:
         return 1.0, effect
 
-    result = scipy.stats.ttest_rel(b, a)
-    pvalue = float(result.pvalue)
-    # ttest_rel returns nan when every paired difference is identical (zero
-    # variance). Zero variance with a nonzero effect is degenerate for so few
-    # samples; treat it as not significant rather than infinitely significant.
-    if numpy.isnan(pvalue):
+    pvalue = float(scipy.stats.ttest_rel(b, a).pvalue)
+    if numpy.isnan(pvalue):  # zero variance (all diffs identical)
         pvalue = 1.0
     return pvalue, effect
 
@@ -464,22 +453,12 @@ def ab_performance_test(
 ):
     """Does an A/B-test of the specified test with the given firecracker/jailer binaries.
 
-    A single measurement run collects ~hundreds of samples, but they all share one
-    microVM boot / host / time window, so they are NOT independent. Pooling them into
-    one permutation test underestimates run-to-run variance (pseudo-replication) and
-    reports ordinary measurement noise as a highly significant regression.
-
-    To avoid this we treat each A/B iteration as one independent observation:
-      1. Run iteration 1 and screen it with the (over-sensitive) pooled test. If it is
-         clean, return immediately -- a clean over-sensitive screen means there is
-         nothing to confirm, so green runs keep their current 1-iteration cost.
-      2. Otherwise run the remaining iterations, recording each iteration's per-metric
-         MEAN for every dimension.
-      3. Report a regression only if, across the iterations, the paired run-level
-         t-test is significant (significance from run-to-run variance, not sample
-         count) AND the mean relative change exceeds the noise threshold. The t-test
-         rejects wandering pseudo-replication noise; the magnitude floor rejects small
-         but systematic per-host measurement bias.
+    Samples within one run are correlated (shared host/boot/window), so pooling them
+    into one test over-reports noise as a regression. Instead, treat each iteration as
+    one independent observation:
+      1. Screen iteration 1 with the pooled test; if clean, return (green runs stay 1x).
+      2. Otherwise collect per-iteration means and confirm with the run-level test
+         (see _runlevel_analysis), stopping early once the verdict is decided.
     """
 
     # Per (dimension_set, metric): lists of per-iteration means for A and B, plus unit.
@@ -509,8 +488,8 @@ def ab_performance_test(
         record(data_b, means_b)
         iterations_run += 1
 
-        # Cheap green path: the pooled screen is over-sensitive, so a clean first
-        # iteration means there is nothing worth spending more iterations to confirm.
+        # Screen with the over-sensitive pooled test; a clean iteration 1 has nothing
+        # to confirm. Need >= 2 iterations before run-to-run variance is defined.
         if i == 0:
             screen = analyze_data(
                 data_a, data_b, p_thresh, strength_abs_thresh, noise_threshold
@@ -518,15 +497,57 @@ def ab_performance_test(
             if not screen:
                 print("No regressions detected (clean screening iteration)!")
                 return
+            print(f"Screen flagged {len(screen)} candidate(s); collecting more data...")
+            continue
+
+        # Early stop: keep iterating only while a candidate is undecided (above the
+        # noise floor but not yet significant). Otherwise the verdict cannot change.
+        error_messages, undecided = _runlevel_analysis(
+            means_a, means_b, units, p_thresh, strength_abs_thresh, noise_threshold
+        )
+        if error_messages:
             print(
-                f"Screening iteration flagged {len(screen)} candidate(s); "
-                f"running {max_iterations - 1} more iteration(s) to test for "
-                f"reproducible, run-level significant regressions..."
+                f"Confirmed {len(error_messages)} regression(s) after "
+                f"{iterations_run} iterations; stopping early."
+            )
+            break
+        if not undecided:
+            print(
+                f"No candidate remains above the noise floor after "
+                f"{iterations_run} iterations; stopping early."
+            )
+            break
+        if iterations_run < max_iterations:
+            print(
+                f"{len(undecided)} candidate(s) still borderline after "
+                f"{iterations_run} iterations; collecting more data..."
             )
 
-    # Run-level analysis across the independent iterations.
+    # Final verdict on whatever data we ended up collecting.
+    error_messages, _ = _runlevel_analysis(
+        means_a, means_b, units, p_thresh, strength_abs_thresh, noise_threshold
+    )
+    if not error_messages:
+        print(
+            f"No reproducible, run-level significant regressions across "
+            f"{iterations_run} iterations."
+        )
+    assert not error_messages, "\n" + "\n".join(error_messages)
+    print("No reproducible regressions detected!")
+
+
+def _runlevel_analysis(
+    means_a, means_b, units, p_thresh, strength_abs_thresh, noise_threshold
+):
+    """Run the paired run-level test on the per-iteration means collected so far.
+
+    Returns (error_messages, undecided_keys): confirmed regressions (significant AND
+    above the noise floor), and keys still above the floor but not yet significant
+    (more iterations could decide them). Keys below the floor are decided-clean.
+    """
     do_not_print_list = uninteresting_dimensions({ds: {} for (ds, _metric) in means_a})
     error_messages = []
+    undecided = []
     for key in means_a:
         dimension_set, metric = key
         if is_ignored(dict(dimension_set) | {"metric": metric}):
@@ -540,28 +561,27 @@ def ab_performance_test(
         strong_enough = abs(effect) > strength_abs_thresh.get(metric)
         above_noise = abs(relative_change) > noise_threshold.get(metric)
 
-        if significant and strong_enough and above_noise:
+        if not above_noise:  # below the floor: decided clean
+            continue
+
+        if significant and strong_enough:
             old_mean = numpy.mean(means_a[key])
             new_mean = numpy.mean(means_b[key])
             unit = units[key]
+            iterations = len(means_a[key])
             msg = (
                 f"\033[0;32m[Firecracker A/B-Test Runner]\033[0m A/B-testing shows a change of "
                 f"{format_with_reduced_unit(effect, unit)}, or {relative_change:.2%}, "
                 f"(from {format_with_reduced_unit(old_mean, unit)} to {format_with_reduced_unit(new_mean, unit)}) "
                 f"for metric \033[1m{metric}\033[0m with \033[0;31m\033[1mp={pvalue}\033[0m "
-                f"across {iterations_run} independent iterations. "
+                f"across {iterations} independent iterations. "
                 f"Tested Dimensions:\n{json.dumps({k: v for k, v in dimension_set if k not in do_not_print_list}, indent=2, sort_keys=True)}"
             )
             error_messages.append(msg)
+        else:  # above the floor but not yet significant
+            undecided.append(key)
 
-    if not error_messages:
-        print(
-            f"No reproducible, run-level significant regressions across "
-            f"{iterations_run} iterations."
-        )
-
-    assert not error_messages, "\n" + "\n".join(error_messages)
-    print("No reproducible regressions detected!")
+    return error_messages, undecided
 
 
 def main():

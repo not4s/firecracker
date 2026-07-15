@@ -11,8 +11,15 @@ from framework.utils import configure_mmds, populate_data_store
 # Default IPv4 address for MMDS
 DEFAULT_IPV4 = "169.254.169.254"
 
-# Number of iterations for performance measurements
+# Number of steady-state samples to keep per metric.
 ITERATIONS = 500
+# Warm-up requests discarded before measuring. The first requests of a batch pay
+# for cold caches; discarding them keeps the sample representative.
+WARMUP = 10
+
+TOKEN_URL = f"http://{DEFAULT_IPV4}/latest/api/token"
+DATA_URL = f"http://{DEFAULT_IPV4}/latest/meta-data/instance-id"
+EXPECTED_RESPONSE = '"i-1234567890abcdef0"'
 
 
 def parse_curl_timing(prefix: str, timing_line: str):
@@ -50,12 +57,21 @@ def mmds_microvm(uvm):
 @pytest.mark.nonci
 def test_mmds_token(mmds_microvm, metrics):
     """
-    Test MMDS token generation performance using curl timing from within the guest.
+    Test MMDS token generation and data-request performance.
 
-    This test measures the time it takes to generate MMDS session tokens
-    and perform data requests using curl's built-in timing capabilities.
-    Curl invocations are batched into single SSH calls for efficiency.
+    Previously this test spawned a fresh ``curl`` process (with a fresh TCP
+    connection) for every request. At MMDS's microsecond-scale response times the
+    per-request process fork and connection setup dominate and jitter, producing
+    run-to-run volatility that tripped the A/B statistical gate as a false positive.
+
+    Instead, each metric is measured by a *single* ``curl`` process that performs
+    all requests over one reused connection (``curl -K`` reads a config file whose
+    transfers are separated by ``next``; curl keeps the connection alive across
+    same-host transfers). The first WARMUP requests are discarded. This measures
+    MMDS handling time rather than curl/connection overhead.
     """
+
+    total = ITERATIONS + WARMUP
 
     metrics.set_dimensions(
         {
@@ -64,60 +80,71 @@ def test_mmds_token(mmds_microvm, metrics):
         }
     )
 
-    # Batch all curl invocations in a single SSH call using a shell loop.
-    # Each iteration generates a token (PUT) then uses it to fetch data (GET).
-    # We use -o /tmp/mmds_token so curl writes the token body to file and only
-    # outputs the -w timing string to stdout. Then we cat the token and run the
-    # GET request. Output per iteration (4 lines + delimiter):
-    #   token_generation_time:<gen_seconds>
-    #   <token>
-    #   <response>
-    #   request_time:<req_seconds>
-    #   ---
-    # noinspection HttpUrlsUsage
-    batch_cmd = (
-        f"for i in $(seq 1 {ITERATIONS}); do "
-        f"curl -m 2 -s -w 'token_generation_time:%{{time_total}}\\n' "
-        f"-X PUT -H 'X-metadata-token-ttl-seconds: 60' "
-        f"-o /tmp/mmds_token "
-        f"http://{DEFAULT_IPV4}/latest/api/token; "
-        f"cat /tmp/mmds_token; echo; "
-        f"curl -m 2 -s -w '\\nrequest_time:%{{time_total}}\\n' "
-        f"-X GET "
-        f'-H "X-metadata-token: $(cat /tmp/mmds_token)" '
-        f"-H 'Accept: application/json' "
-        f"http://{DEFAULT_IPV4}/latest/meta-data/instance-id; "
-        f"echo '---'; "
-        f"done"
+    # --- token_generation_time: `total` PUTs over one reused connection ---
+    # A single-transfer curl config block is written once (quoted heredoc, so
+    # %{time_total} and \n pass through to curl literally), repeated `total` times,
+    # and fed to one curl process. Bodies are discarded; we only need per-request
+    # timing on stdout as `token_generation_time:<seconds>` lines.
+    gen_cmd = (
+        "cat > /tmp/mmds_tok_block <<'EOF'\n"
+        f'url = "{TOKEN_URL}"\n'
+        'request = "PUT"\n'
+        'header = "X-metadata-token-ttl-seconds: 60"\n'
+        'output = "/dev/null"\n'
+        'write-out = "token_generation_time:%{time_total}\\n"\n'
+        "next\n"
+        "EOF\n"
+        f"for _ in $(seq 1 {total}); do cat /tmp/mmds_tok_block; done "
+        "> /tmp/mmds_tok_cfg\n"
+        "curl -sS -K /tmp/mmds_tok_cfg"
     )
+    _, gen_out, gen_err = mmds_microvm.ssh.check_output(gen_cmd)
+    assert gen_err == "", f"Error generating MMDS tokens: {gen_err}"
 
-    _, stdout, stderr = mmds_microvm.ssh.check_output(batch_cmd)
-    assert stderr == "", "Error calling MMDS"
+    gen_times = re.findall(r"token_generation_time:([\d.]+)", gen_out)
+    assert (
+        len(gen_times) == total
+    ), f"Expected {total} token timings, got {len(gen_times)}"
+    for value in gen_times[WARMUP:]:
+        metrics.put_metric("token_generation_time", float(value) * 1000, "Milliseconds")
 
-    # Parse batched output (splitting by '---', and removing last empty token)
-    iterations = stdout.split("---\n")
-    assert iterations[-1] == ""
-    iterations = iterations[:-1]
-    assert len(iterations) == ITERATIONS
+    # --- request_time: `total` GETs over one reused connection ---
+    # Fetch one token (valid 60s, comfortably longer than the batch) and reuse it
+    # for every data request. The GET config block substitutes the token (unquoted
+    # heredoc expands $TOKEN but leaves \n and %{...} for curl). Each transfer emits
+    # the response body followed by `request_time:<seconds>` and a `---` delimiter,
+    # so we can both validate the response and read the timing.
+    req_cmd = (
+        "TOKEN=$(curl -sS -X PUT -H 'X-metadata-token-ttl-seconds: 60' "
+        f"{TOKEN_URL})\n"
+        "cat > /tmp/mmds_get_block <<EOF\n"
+        f'url = "{DATA_URL}"\n'
+        'header = "X-metadata-token: $TOKEN"\n'
+        'header = "Accept: application/json"\n'
+        'write-out = "\\nrequest_time:%{time_total}\\n---\\n"\n'
+        "EOF\n"
+        f"for i in $(seq 1 {total}); do "
+        '[ "$i" -gt 1 ] && echo next; cat /tmp/mmds_get_block; '
+        "done > /tmp/mmds_get_cfg\n"
+        "curl -sS -K /tmp/mmds_get_cfg"
+    )
+    _, req_out, req_err = mmds_microvm.ssh.check_output(req_cmd)
+    assert req_err == "", f"Error calling MMDS: {req_err}"
 
-    for block in iterations:
+    # Each block is "<body>\nrequest_time:<seconds>", separated by "---".
+    blocks = [b for b in req_out.split("---\n") if b.strip()]
+    assert len(blocks) == total, f"Expected {total} request blocks, got {len(blocks)}"
+
+    for i, block in enumerate(blocks):
         lines = block.strip().split("\n")
-        assert len(lines) == 4, f"Unexpected output block: {block}"
+        assert len(lines) == 2, f"Unexpected output block: {block!r}"
 
-        # Line 0: time_total from token generation (body went to file)
-        generation_time_ms = parse_curl_timing("token_generation_time", lines[0])
-        metrics.put_metric("token_generation_time", generation_time_ms, "Milliseconds")
-
-        # Line 1: token value (from cat)
-        token = lines[1].strip()
-        assert len(token) > 0, f"Token generation failed. Block: {block}"
-
-        # Line 2: response body from GET request
-        response = lines[2].strip()
+        response = lines[0].strip()
         assert (
-            response == '"i-1234567890abcdef0"'
+            response == EXPECTED_RESPONSE
         ), f"MMDS request failed. Response: {response}"
 
-        # Line 3: time_total from GET request
-        request_time_ms = parse_curl_timing("request_time", lines[3])
+        if i < WARMUP:
+            continue
+        request_time_ms = parse_curl_timing("request_time", lines[1])
         metrics.put_metric("request_time", request_time_ms, "Milliseconds")

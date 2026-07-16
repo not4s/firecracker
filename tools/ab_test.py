@@ -229,7 +229,21 @@ def collect_data(
         shell=True,
     )
 
-    return load_data_series(Path(test_path))
+    series = load_data_series(Path(test_path))
+
+    # EXPERIMENT (positive control): if FC_TEST_INJECT_B_SCALE is set, multiply every
+    # B-side metric value by that factor. This injects a KNOWN regression on top of the
+    # real (noisy) measurement so we can confirm the gate still fires on genuine signal
+    # (as opposed to only firing less on noise). Inert unless the env var is set.
+    inject = os.environ.get("FC_TEST_INJECT_B_SCALE")
+    if inject and tag == "B":
+        scale = float(inject)
+        print(f"[inject] scaling ALL B-side values by {scale} (positive control)")
+        for dimension_set, metrics in series.items():
+            for metric, (values, unit) in metrics.items():
+                series[dimension_set][metric] = ([v * scale for v in values], unit)
+
+    return series
 
 
 def check_regression(
@@ -401,6 +415,17 @@ def analyze_data(
 
         relative_changes_by_metric[metric].append(result.statistic / baseline_mean)
 
+        # EXPERIMENT (p-calibration): emit EVERY dimension's p-value and relative change,
+        # not just the ones that fire, so we can histogram the null distribution. On a
+        # self-compare (true delta 0) a calibrated test gives p ~ Uniform[0,1]; a
+        # pseudo-replicated test piles them near 0. Inert unless the env var is set.
+        if os.environ.get("FC_TEST_PRINT_ALL_P"):
+            rel = result.statistic / baseline_mean if baseline_mean else 0.0
+            print(
+                f"[pcal] metric={metric} p={result.pvalue} rel={rel:.4%} "
+                f"dims={dict(dimension_set)}"
+            )
+
         if result.pvalue < p_thresh.get(metric) and abs(
             result.statistic
         ) > strength_abs_thresh.get(metric):
@@ -560,6 +585,15 @@ def _runlevel_analysis(
         significant = pvalue < p_thresh.get(metric)
         strong_enough = abs(effect) > strength_abs_thresh.get(metric)
         above_noise = abs(relative_change) > noise_threshold.get(metric)
+
+        # EXPERIMENT (p-calibration): emit the RUN-LEVEL p-value for every dimension,
+        # regardless of floor, so we can histogram the null distribution of the paired
+        # t-test (should be ~Uniform[0,1] on a self-compare). Inert unless env var set.
+        if os.environ.get("FC_TEST_PRINT_ALL_P"):
+            print(
+                f"[pcal-rl] metric={metric} p={pvalue} rel={relative_change:.4%} "
+                f"k={len(means_a[key])} dims={dict(dimension_set)}"
+            )
 
         if not above_noise:  # below the floor: decided clean
             continue

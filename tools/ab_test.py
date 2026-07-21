@@ -401,6 +401,10 @@ def analyze_data(
 
         relative_changes_by_metric[metric].append(result.statistic / baseline_mean)
 
+        if os.environ.get("FC_TEST_PRINT_ALL_P"):
+            rel = result.statistic / baseline_mean if baseline_mean else 0.0
+            print(f"[pcal] metric={metric} p={result.pvalue} rel={rel:.4%}")
+
         if result.pvalue < p_thresh.get(metric) and abs(
             result.statistic
         ) > strength_abs_thresh.get(metric):
@@ -564,6 +568,12 @@ def _runlevel_analysis(
         significant = pvalue < p_thresh.get(metric)
         strong_enough = abs(effect) > strength_abs_thresh.get(metric)
         above_noise = abs(relative_change) > noise_threshold.get(metric)
+
+        if os.environ.get("FC_TEST_PRINT_ALL_P"):
+            print(
+                f"[pcal-rl] metric={metric} p={pvalue} rel={relative_change:.4%} "
+                f"k={len(means_a[key])}"
+            )
 
         if not above_noise:  # below the floor: decided clean
             continue

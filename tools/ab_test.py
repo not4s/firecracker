@@ -374,6 +374,10 @@ def analyze_data(
 
         relative_changes_by_metric[metric].append(result.statistic / baseline_mean)
 
+        if os.environ.get("FC_TEST_PRINT_ALL_P"):
+            rel = result.statistic / baseline_mean if baseline_mean else 0.0
+            print(f"[pcal] metric={metric} p={result.pvalue} rel={rel:.4%}")
+
         if result.pvalue < p_thresh.get(metric) and abs(
             result.statistic
         ) > strength_abs_thresh.get(metric):

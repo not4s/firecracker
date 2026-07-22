@@ -21,7 +21,8 @@ pub use vm_memory::{
     GuestUsize, MemoryRegionAddress, MmapRegion, address,
 };
 use vm_memory::{
-    GuestMemoryError, GuestMemoryRegionBytes, VolatileMemory, VolatileSlice, WriteVolatile,
+    GuestMemoryError, GuestMemoryRegionBytes, RegionCache, VolatileMemory, VolatileSlice,
+    WriteVolatile,
 };
 
 use crate::DirtyBitmap;
@@ -39,17 +40,9 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 pub type GuestMmapRegion = vm_memory::MmapRegion<Option<AtomicBitmap>>;
 
 /// A cached translation for a contiguous range of guest memory within a single region.
-/// Analogous to QEMU's MemoryRegionCache. Created once at setup time, reused for
-/// every access to that range. Skips find_region and to_region_addr on each access.
+/// Created once at setup time and reused for every access to that range.
 #[derive(Clone, Debug)]
-pub struct MemoryRegionCache {
-    /// Keeps the region (and its underlying mmap) alive.
-    region: Arc<GuestRegionMmapExt>,
-    /// Pre-computed offset of the range's start within the region.
-    region_offset: usize,
-    /// Validated length of the cached range in bytes.
-    len: usize,
-}
+pub struct MemoryRegionCache(RegionCache<GuestRegionMmapExt>);
 
 impl MemoryRegionCache {
     /// Translate `addr..addr+len` once, validate it fits in a single region.
@@ -58,35 +51,13 @@ impl MemoryRegionCache {
         addr: GuestAddress,
         len: usize,
     ) -> Result<Self, GuestMemoryError> {
-        let region = mem
-            .find_region_arc(addr)
-            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
-        let region_addr = region
-            .to_region_addr(addr)
-            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
-        region
-            .checked_offset(region_addr, len.saturating_sub(1))
-            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
-
-        Ok(Self {
-            region,
-            region_offset: region_addr.raw_value() as usize,
-            len,
-        })
+        mem.region_cache(addr, len).map(Self)
     }
 
     /// Read a `T` at the given byte offset within the cached range.
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
-        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        let slice = self
-            .region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        let vref = slice
-            .get_ref::<T>(0)
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        Ok(vref.load())
+        self.0.load(offset)
     }
 
     /// Write a `T` at the given byte offset within the cached range.
@@ -96,16 +67,7 @@ impl MemoryRegionCache {
         val: T,
         offset: usize,
     ) -> Result<(), GuestMemoryError> {
-        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        let slice = self
-            .region
-            .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        let vref = slice
-            .get_ref::<T>(0)
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
-        vref.store(val);
-        Ok(())
+        self.0.store(val, offset)
     }
 }
 

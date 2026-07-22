@@ -176,10 +176,7 @@ impl DescriptorChain {
     }
 
     /// Gets the next descriptor in this descriptor chain, if there is one.
-    ///
-    /// Reads the next descriptor through `desc_cache`, populating it from the descriptor
-    /// table on first use. A chain with no successor never touches the cache, so a
-    /// single-descriptor chain does not pay for its construction.
+    /// Populates `desc_cache` from the descriptor table on first use.
     pub fn next_descriptor_cached(
         &self,
         mem: &GuestMemoryMmap,

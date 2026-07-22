@@ -312,7 +312,7 @@ impl<'a> From<&'a mut [u8]> for VolatileSlice<'a, ()> {
 }
 
 #[repr(C, packed)]
-struct Packed<T>(T);
+pub(crate) struct Packed<T>(pub(crate) T);
 
 /// A guard to perform mapping and protect unmapping of the memory.
 #[derive(Debug)]

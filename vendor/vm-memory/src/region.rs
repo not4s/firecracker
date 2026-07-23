@@ -322,6 +322,18 @@ impl<R: GuestMemoryRegion> GuestMemoryBackend for GuestRegionCollection<R> {
     }
 }
 
+impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
+    /// Like `find_region`, but returns an `Arc` handle to the region.
+    pub fn find_region_arc(&self, addr: GuestAddress) -> Option<Arc<R>> {
+        let index = match self.regions.binary_search_by_key(&addr, |x| x.start_addr()) {
+            Ok(x) => Some(x),
+            Err(x) if (x > 0 && addr <= self.regions[x - 1].last_addr()) => Some(x - 1),
+            _ => None,
+        };
+        index.map(|x| Arc::clone(&self.regions[x]))
+    }
+}
+
 /// A marker trait that if implemented on a type `R` makes available a default
 /// implementation of `Bytes<MemoryRegionAddress>` for `R`, based on the assumption
 /// that the entire `GuestMemoryRegion` is just traditional memory without any

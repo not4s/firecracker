@@ -178,18 +178,28 @@ impl DescriptorChain {
         usize::from(self.queue_size) * std::mem::size_of::<Descriptor>()
     }
 
-    /// Gets the next descriptor in this descriptor chain, if there is one,
-    /// reading it through the given descriptor-table cache.
-    pub fn next_descriptor_cached(&self, desc_cache: &MemoryRegionCache) -> Option<Self> {
-        if self.has_next() {
-            DescriptorChain::checked_new(desc_cache, self.desc_table, self.queue_size, self.next)
-                .map(|mut c| {
-                    c.ttl = self.ttl - 1;
-                    c
-                })
-        } else {
-            None
+    /// Gets the next descriptor in this descriptor chain, if there is one.
+    /// Populates `desc_cache` from the descriptor table on first use.
+    pub fn next_descriptor_cached(
+        &self,
+        mem: &GuestMemoryMmap,
+        desc_cache: &mut Option<MemoryRegionCache>,
+    ) -> Option<Self> {
+        if !self.has_next() {
+            return None;
         }
+        let desc_cache = match desc_cache {
+            Some(cache) => cache,
+            None => desc_cache.insert(
+                MemoryRegionCache::new(mem, self.desc_table, self.desc_table_size()).ok()?,
+            ),
+        };
+        DescriptorChain::checked_new(desc_cache, self.desc_table, self.queue_size, self.next).map(
+            |mut c| {
+                c.ttl = self.ttl - 1;
+                c
+            },
+        )
     }
 
     /// Gets the next descriptor in this descriptor chain, if there is one,
@@ -1038,7 +1048,7 @@ mod verification {
     fn verify_avail_ring_ring_get() {
         let ProofContext(queue, _) = kani::any();
         let x: usize = kani::any_where(|x| *x < usize::from(queue.size));
-        unsafe { _ = queue.avail_ring_ring_get(x) };
+        _ = queue.avail_ring_ring_get(x);
     }
 
     #[kani::proof]
@@ -1064,7 +1074,7 @@ mod verification {
             id: kani::any(),
             len: kani::any(),
         };
-        unsafe { queue.used_ring_ring_set(x, used_element) };
+        queue.used_ring_ring_set(x, used_element);
     }
 
     #[kani::proof]

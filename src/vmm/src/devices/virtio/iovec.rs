@@ -60,11 +60,9 @@ impl IoVecBuffer {
         mem: &GuestMemoryMmap,
         head: DescriptorChain,
     ) -> Result<(), IoVecError> {
-        let desc_cache =
-            MemoryRegionCache::new(mem, head.desc_table_addr(), head.desc_table_size())
-                .map_err(IoVecError::GuestMemory)?;
         self.clear();
 
+        let mut desc_cache = None;
         let mut next_descriptor = Some(head);
         while let Some(desc) = next_descriptor {
             if desc.is_write_only() {
@@ -88,7 +86,7 @@ impl IoVecBuffer {
                 .checked_add(desc.len)
                 .ok_or(IoVecError::OverflowedDescriptor)?;
 
-            next_descriptor = desc.next_descriptor_cached(&desc_cache);
+            next_descriptor = desc.next_descriptor_cached(mem, &mut desc_cache);
         }
 
         Ok(())
@@ -260,10 +258,8 @@ impl<const L: u16> IoVecBufferMut<L> {
         mem: &GuestMemoryMmap,
         head: DescriptorChain,
     ) -> Result<ParsedDescriptorChain, IoVecError> {
-        let desc_cache =
-            MemoryRegionCache::new(mem, head.desc_table_addr(), head.desc_table_size())
-                .map_err(IoVecError::GuestMemory)?;
         let head_index = head.index;
+        let mut desc_cache = None;
         let mut next_descriptor = Some(head);
         let mut length = 0u32;
         let mut nr_iovecs = 0u16;
@@ -305,7 +301,7 @@ impl<const L: u16> IoVecBufferMut<L> {
                     self.vecs.pop_back(nr_iovecs);
                 })?;
 
-            next_descriptor = desc.next_descriptor_cached(&desc_cache);
+            next_descriptor = desc.next_descriptor_cached(mem, &mut desc_cache);
         }
 
         self.len = self.len.checked_add(length).ok_or_else(|| {

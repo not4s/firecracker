@@ -14,7 +14,7 @@ use vm_memory::{
 use super::iov_deque::{IovDeque, IovDequeError};
 use super::queue::FIRECRACKER_MAX_QUEUE_SIZE;
 use crate::devices::virtio::queue::DescriptorChain;
-use crate::vstate::memory::GuestMemoryMmap;
+use crate::vstate::memory::{GuestMemoryMmap, MemoryRegionCache};
 
 #[derive(Debug, thiserror::Error, displaydoc::Display)]
 pub enum IoVecError {
@@ -60,6 +60,9 @@ impl IoVecBuffer {
         mem: &GuestMemoryMmap,
         head: DescriptorChain,
     ) -> Result<(), IoVecError> {
+        let desc_cache =
+            MemoryRegionCache::new(mem, head.desc_table_addr(), head.desc_table_size())
+                .map_err(IoVecError::GuestMemory)?;
         self.clear();
 
         let mut next_descriptor = Some(head);
@@ -85,7 +88,7 @@ impl IoVecBuffer {
                 .checked_add(desc.len)
                 .ok_or(IoVecError::OverflowedDescriptor)?;
 
-            next_descriptor = desc.next_descriptor(mem);
+            next_descriptor = desc.next_descriptor_cached(&desc_cache);
         }
 
         Ok(())
@@ -257,6 +260,9 @@ impl<const L: u16> IoVecBufferMut<L> {
         mem: &GuestMemoryMmap,
         head: DescriptorChain,
     ) -> Result<ParsedDescriptorChain, IoVecError> {
+        let desc_cache =
+            MemoryRegionCache::new(mem, head.desc_table_addr(), head.desc_table_size())
+                .map_err(IoVecError::GuestMemory)?;
         let head_index = head.index;
         let mut next_descriptor = Some(head);
         let mut length = 0u32;
@@ -299,7 +305,7 @@ impl<const L: u16> IoVecBufferMut<L> {
                     self.vecs.pop_back(nr_iovecs);
                 })?;
 
-            next_descriptor = desc.next_descriptor(mem);
+            next_descriptor = desc.next_descriptor_cached(&desc_cache);
         }
 
         self.len = self.len.checked_add(length).ok_or_else(|| {

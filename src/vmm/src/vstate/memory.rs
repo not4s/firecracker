@@ -37,6 +37,60 @@ use crate::{DirtyBitmap, align_up, warn_unrestricted};
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 
+/// A cached translation for a contiguous range of guest memory within a single region.
+/// Resolved once, reused for every access.
+#[derive(Clone, Debug)]
+pub struct MemoryRegionCache {
+    /// Keeps the region (and its underlying mmap) alive.
+    region: Arc<GuestRegionMmapExt>,
+    /// Offset of the cached range's start within the region.
+    region_offset: usize,
+}
+
+impl MemoryRegionCache {
+    /// Translates `addr..addr+len`, validating that it fits in a single region.
+    pub fn new(
+        mem: &GuestMemoryMmap,
+        addr: GuestAddress,
+        len: usize,
+    ) -> Result<Self, GuestMemoryError> {
+        let region = mem
+            .find_region_arc(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let region_addr = region
+            .to_region_addr(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        region
+            .checked_offset(region_addr, len.saturating_sub(1))
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+
+        Ok(Self {
+            region,
+            region_offset: u64_to_usize(region_addr.raw_value()),
+        })
+    }
+
+    /// Reads a `T` at the given byte offset within the cached range.
+    #[inline]
+    pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
+        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
+        self.region
+            .get_slice(addr, std::mem::size_of::<T>())
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
+            .and_then(|slice| Bytes::read_obj(&slice, 0).map_err(Into::into))
+    }
+
+    /// Writes a `T` at the given byte offset within the cached range.
+    #[inline]
+    pub fn write_obj<T: ByteValued>(&self, val: T, offset: usize) -> Result<(), GuestMemoryError> {
+        let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
+        self.region
+            .get_slice(addr, std::mem::size_of::<T>())
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
+            .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
+    }
+}
+
 /// The alignment used to allocate guest memory.
 /// Chosen to enable optimizations on host kernel, e.g. allow huge pages at the beginning of the memory space.
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);

@@ -2,9 +2,10 @@
 
 use crate::bitmap::{Bitmap, BS};
 use crate::guest_memory::Result;
+use crate::volatile_memory::Packed;
 use crate::{
-    Address, AtomicAccess, Bytes, FileOffset, GuestAddress, GuestMemoryBackend, GuestMemoryError,
-    GuestUsize, MemoryRegionAddress, ReadVolatile, VolatileSlice, WriteVolatile,
+    Address, AtomicAccess, ByteValued, Bytes, FileOffset, GuestAddress, GuestMemoryBackend,
+    GuestMemoryError, GuestUsize, MemoryRegionAddress, ReadVolatile, VolatileSlice, WriteVolatile,
 };
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -331,6 +332,93 @@ impl<R: GuestMemoryRegion> GuestRegionCollection<R> {
             _ => None,
         };
         index.map(|x| Arc::clone(&self.regions[x]))
+    }
+
+    /// Validate that `addr..addr + len` lies within a single region and return a
+    /// [`RegionCache`] for it.
+    pub fn region_cache(&self, addr: GuestAddress, len: usize) -> Result<RegionCache<R>> {
+        let region = self
+            .find_region_arc(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let region_addr = region
+            .to_region_addr(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        RegionCache::new(region, region_addr, len)
+    }
+}
+
+/// A validated reference to a contiguous range of guest memory within a single region.
+///
+/// Resolving a guest address requires a region lookup and a bounds check. For ranges
+/// that are accessed repeatedly, such as virtio queue rings, a `RegionCache` performs
+/// the translation once: each access is then a single bounds check against the
+/// validated length followed by a volatile access through the resolved pointer.
+///
+/// The whole range is marked dirty on construction; accesses do not update the dirty
+/// bitmap. Callers that rely on dirty tracking across bitmap resets must re-create the
+/// cache (or re-mark the range) before collecting the bitmap, as with any cached host
+/// pointer.
+#[derive(Debug)]
+pub struct RegionCache<R> {
+    /// Keeps the region (and its underlying mapping) alive so `base` stays valid.
+    #[allow(dead_code)]
+    region: Arc<R>,
+    /// Host address of the start of the range, resolved on construction.
+    base: *mut u8,
+    /// Length of the validated range in bytes.
+    len: usize,
+}
+
+impl<R> Clone for RegionCache<R> {
+    fn clone(&self) -> Self {
+        Self {
+            region: Arc::clone(&self.region),
+            base: self.base,
+            len: self.len,
+        }
+    }
+}
+
+// SAFETY: `base` points into the mapping owned by `region`, which the `Arc` keeps
+// alive for the lifetime of this value, and all accesses through it are volatile.
+unsafe impl<R: Send + Sync> Send for RegionCache<R> {}
+
+impl<R: GuestMemoryRegion> RegionCache<R> {
+    /// Validate that `addr..addr + len` lies within `region` and cache the resolved
+    /// host pointer. The whole range is marked dirty.
+    pub fn new(region: Arc<R>, addr: MemoryRegionAddress, len: usize) -> Result<Self> {
+        let base = {
+            let slice = region.get_slice(addr, len)?;
+            slice.bitmap().mark_dirty(0, len);
+            slice.ptr_guard_mut().as_ptr()
+        };
+        Ok(Self { region, base, len })
+    }
+
+    /// Read a `T` at `offset` bytes into the range.
+    #[inline]
+    pub fn load<T: ByteValued>(&self, offset: usize) -> Result<T> {
+        let size = std::mem::size_of::<T>();
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
+            return Err(GuestMemoryError::InvalidBackendAddress);
+        }
+        // SAFETY: the check above keeps `[offset, offset + size)` within the range
+        // validated in `new()`; `Packed<T>` is 1-aligned, so the volatile read is
+        // defined at any address.
+        Ok(unsafe { (self.base.add(offset) as *const Packed<T>).read_volatile().0 })
+    }
+
+    /// Write a `T` at `offset` bytes into the range.
+    #[inline]
+    pub fn store<T: ByteValued>(&self, val: T, offset: usize) -> Result<()> {
+        let size = std::mem::size_of::<T>();
+        if offset.checked_add(size).is_none_or(|end| end > self.len) {
+            return Err(GuestMemoryError::InvalidBackendAddress);
+        }
+        // SAFETY: as in `load`, the target is within the validated range and
+        // `Packed<T>` is 1-aligned.
+        unsafe { (self.base.add(offset) as *mut Packed<T>).write_volatile(Packed(val)) };
+        Ok(())
     }
 }
 

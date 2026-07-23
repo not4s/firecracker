@@ -24,7 +24,8 @@ pub use vm_memory::{
     MemoryRegionAddress, MmapRegion, address,
 };
 use vm_memory::{
-    GuestMemoryBackend, GuestMemoryError, GuestMemoryRegionBytes, VolatileSlice, WriteVolatile,
+    GuestMemoryBackend, GuestMemoryError, GuestMemoryRegionBytes, VolatileMemory, VolatileSlice,
+    WriteVolatile,
 };
 
 use crate::arch::host_page_size;
@@ -74,20 +75,29 @@ impl MemoryRegionCache {
     #[inline]
     pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
+        let slice = self
+            .region
             .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::read_obj(&slice, 0).map_err(Into::into))
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        let vref = slice
+            .get_ref::<T>(0)
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        Ok(vref.load())
     }
 
     /// Writes a `T` at the given byte offset within the cached range.
     #[inline]
     pub fn write_obj<T: ByteValued>(&self, val: T, offset: usize) -> Result<(), GuestMemoryError> {
         let addr = MemoryRegionAddress((self.region_offset + offset) as u64);
-        self.region
+        let slice = self
+            .region
             .get_slice(addr, std::mem::size_of::<T>())
-            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))
-            .and_then(|slice| Bytes::write_obj(&slice, val, 0).map_err(Into::into))
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        let vref = slice
+            .get_ref::<T>(0)
+            .map_err(|_| GuestMemoryError::InvalidGuestAddress(GuestAddress(0)))?;
+        vref.store(val);
+        Ok(())
     }
 }
 

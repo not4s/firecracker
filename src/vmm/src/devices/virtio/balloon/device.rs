@@ -554,7 +554,7 @@ impl Balloon {
 
             let mut last_desc = Some(head);
             while let Some(desc) = last_desc {
-                last_desc = desc.next_descriptor();
+                last_desc = desc.next_descriptor(mem);
 
                 // Updated cmd_ids are always of length 4
                 if desc.len == 4 {
@@ -601,7 +601,7 @@ impl Balloon {
                 }
             }
 
-            queue.add_used(head.index, 0)?;
+            queue.add_used(head_index, 0)?;
             needs_interrupt = true;
         }
 
@@ -641,10 +641,10 @@ impl Balloon {
                 } else {
                     METRICS.free_page_report_freed.add(desc.len as u64);
                 }
-                last_desc = desc.next_descriptor();
+                last_desc = desc.next_descriptor(mem);
             }
 
-            queue.add_used(head.index, 0)?;
+            queue.add_used(head_index, 0)?;
             needs_interrupt = true;
         }
 

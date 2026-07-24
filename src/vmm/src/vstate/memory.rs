@@ -37,6 +37,100 @@ use crate::{DirtyBitmap, align_up, warn_unrestricted};
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 
+/// Allows volatile access at any alignment.
+#[repr(C, packed)]
+struct Packed<T>(T);
+
+/// A resolved reference to a region of guest memory. Accesses translate a guest
+/// address to a host pointer, bounds-checked against the region.
+///
+/// The pointer is only valid while the backing mapping is alive.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GuestRegion {
+    /// Pre-biased host pointer: the host address for guest address `a` is `ptr + a`.
+    /// Equal to the region's host base minus its guest start address.
+    ptr: *mut u8,
+    /// Guest physical address of the start of the region.
+    start: u64,
+    /// Length of the region in bytes.
+    len: u64,
+}
+
+// SAFETY: `ptr` is only dereferenced through volatile accesses, and holders require
+// the backing mapping to outlive them.
+unsafe impl Send for GuestRegion {}
+
+impl GuestRegion {
+    /// Resolves the region containing `addr..addr+len` and marks the range dirty.
+    pub fn new<M: GuestMemoryBackend>(
+        mem: &M,
+        addr: GuestAddress,
+        len: usize,
+    ) -> Result<Self, GuestMemoryError> {
+        let region = mem
+            .find_region(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let region_addr = region
+            .to_region_addr(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let slice = region.get_slice(region_addr, len)?;
+        slice.bitmap().mark_dirty(0, len);
+        let ptr = slice
+            .ptr_guard_mut()
+            .as_ptr()
+            .wrapping_sub(u64_to_usize(addr.raw_value()));
+        Ok(Self {
+            ptr,
+            start: region.start_addr().raw_value(),
+            len: region.len(),
+        })
+    }
+
+    /// Returns `Ok` if `addr..addr+len` lies within the region.
+    ///
+    /// A guest address below the region start wraps to an offset larger than any
+    /// region, so a separate underflow check is not needed.
+    #[inline]
+    pub fn check_range(&self, addr: GuestAddress, len: usize) -> Result<(), GuestMemoryError> {
+        let offset = addr.raw_value().wrapping_sub(self.start);
+        if offset
+            .checked_add(len as u64)
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(GuestMemoryError::InvalidGuestAddress(addr));
+        }
+        Ok(())
+    }
+
+    /// Translates `addr` to a host pointer for a `T`-sized access.
+    #[inline]
+    fn host_ptr<T>(&self, addr: GuestAddress) -> Result<*mut u8, GuestMemoryError> {
+        self.check_range(addr, std::mem::size_of::<T>())?;
+        Ok(self.ptr.wrapping_add(u64_to_usize(addr.raw_value())))
+    }
+
+    /// Reads a `T` at the given guest address.
+    #[inline]
+    pub fn read_obj<T: ByteValued>(&self, addr: GuestAddress) -> Result<T, GuestMemoryError> {
+        let ptr = self.host_ptr::<T>(addr)?;
+        // SAFETY: `host_ptr` bounds-checked the access; `Packed<T>` is 1-aligned.
+        Ok(unsafe { ptr.cast::<Packed<T>>().read_volatile().0 })
+    }
+
+    /// Writes a `T` at the given guest address.
+    #[inline]
+    pub fn write_obj<T: ByteValued>(
+        &self,
+        val: T,
+        addr: GuestAddress,
+    ) -> Result<(), GuestMemoryError> {
+        let ptr = self.host_ptr::<T>(addr)?;
+        // SAFETY: `host_ptr` bounds-checked the access; `Packed<T>` is 1-aligned.
+        unsafe { ptr.cast::<Packed<T>>().write_volatile(Packed(val)) };
+        Ok(())
+    }
+}
+
 /// The alignment used to allocate guest memory.
 /// Chosen to enable optimizations on host kernel, e.g. allow huge pages at the beginning of the memory space.
 const GUEST_MEMORY_ALIGNMENT: usize = mib_to_bytes(2);

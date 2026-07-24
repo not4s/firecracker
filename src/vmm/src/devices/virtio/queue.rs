@@ -11,7 +11,7 @@ use vm_memory::GuestMemoryBackend;
 
 use crate::logger::error;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{Bitmap, ByteValued, GuestAddress, GuestMemoryMmap};
+use crate::vstate::memory::{Address, ByteValued, GuestAddress, GuestMemoryMmap, GuestRegion};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -90,7 +90,8 @@ unsafe impl ByteValued for UsedElement {}
 /// A virtio descriptor chain.
 #[derive(Debug, Copy, Clone)]
 pub struct DescriptorChain {
-    desc_table_ptr: *const Descriptor,
+    mem_region: GuestRegion,
+    desc_table: GuestAddress,
 
     queue_size: u16,
     ttl: u16, // used to prevent infinite chain cycles
@@ -116,16 +117,31 @@ impl DescriptorChain {
     /// Creates a new `DescriptorChain` from the given memory and descriptor table.
     ///
     /// Note that the desc_table and queue_size are assumed to be validated by the caller.
-    fn checked_new(desc_table_ptr: *const Descriptor, queue_size: u16, index: u16) -> Option<Self> {
+    fn checked_new(
+        mem_region: GuestRegion,
+        desc_table: GuestAddress,
+        queue_size: u16,
+        index: u16,
+    ) -> Option<Self> {
         if queue_size <= index {
             return None;
         }
 
-        // SAFETY:
-        // index is in 0..queue_size bounds
-        let desc = unsafe { desc_table_ptr.add(usize::from(index)).read_volatile() };
+        let desc_addr = desc_table
+            .unchecked_add((usize::from(index) * std::mem::size_of::<Descriptor>()) as u64);
+        let desc = match mem_region.read_obj::<Descriptor>(desc_addr) {
+            Ok(ret) => ret,
+            Err(err) => {
+                error!(
+                    "Failed to read virtio descriptor from memory at address {:#x}: {}",
+                    desc_addr.0, err
+                );
+                return None;
+            }
+        };
         let chain = DescriptorChain {
-            desc_table_ptr,
+            mem_region,
+            desc_table,
             queue_size,
             ttl: queue_size,
             index,
@@ -161,12 +177,11 @@ impl DescriptorChain {
     /// the head of the next _available_ descriptor chain.
     pub fn next_descriptor(&self) -> Option<Self> {
         if self.has_next() {
-            DescriptorChain::checked_new(self.desc_table_ptr, self.queue_size, self.next).map(
-                |mut c| {
+            DescriptorChain::checked_new(self.mem_region, self.desc_table, self.queue_size, self.next)
+                .map(|mut c| {
                     c.ttl = self.ttl - 1;
                     c
-                },
-            )
+                })
         } else {
             None
         }
@@ -216,49 +231,8 @@ pub struct Queue {
     /// Guest physical address of the used ring
     pub used_ring_address: GuestAddress,
 
-    /// Host virtual address pointer to the descriptor table
-    /// in the guest memory .
-    /// Getting access to the underling
-    /// data structure should only occur after the
-    /// struct is initialized with `new`.
-    /// Representation of in memory struct layout.
-    /// struct DescriptorTable = [Descriptor; <queue_size>]
-    pub desc_table_ptr: *const Descriptor,
-
-    /// Host virtual address pointer to the available ring
-    /// in the guest memory .
-    /// Getting access to the underling
-    /// data structure should only occur after the
-    /// struct is initialized with `new`.
-    ///
-    /// Representation of in memory struct layout.
-    /// struct AvailRing {
-    ///     flags: u16,
-    ///     idx: u16,
-    ///     ring: [u16; <queue size>],
-    ///     used_event: u16,
-    /// }
-    ///
-    /// Because all types in the AvailRing are u16,
-    /// we store pointer as *mut u16 for simplicity.
-    pub avail_ring_ptr: *mut u16,
-
-    /// Host virtual address pointer to the used ring
-    /// in the guest memory .
-    /// Getting access to the underling
-    /// data structure should only occur after the
-    /// struct is initialized with `new`.
-    ///
-    /// Representation of in memory struct layout.
-    // struct UsedRing {
-    //     flags: u16,
-    //     idx: u16,
-    //     ring: [UsedElement; <queue size>],
-    //     avail_event: u16,
-    // }
-    /// Because types in the UsedRing are different (u16 and u32)
-    /// store pointer as *mut u8.
-    pub used_ring_ptr: *mut u8,
+    /// Resolved region holding the rings, set by `initialize`.
+    pub(crate) mem_region: Option<GuestRegion>,
 
     pub next_avail: Wrapping<u16>,
     pub next_used: Wrapping<u16>,
@@ -268,12 +242,6 @@ pub struct Queue {
     /// The number of added used buffers since last guest kick
     pub num_added: Wrapping<u16>,
 }
-
-/// SAFETY: Queue is Send, because we use volatile memory accesses when
-/// working with pointers. These pointers are not copied or store anywhere
-/// else. We assume guest will not give different queues  same guest memory
-/// addresses.
-unsafe impl Send for Queue {}
 
 #[allow(clippy::len_without_is_empty)]
 impl Queue {
@@ -286,11 +254,7 @@ impl Queue {
             desc_table_address: GuestAddress(0),
             avail_ring_address: GuestAddress(0),
             used_ring_address: GuestAddress(0),
-
-            desc_table_ptr: std::ptr::null(),
-            avail_ring_ptr: std::ptr::null_mut(),
-            used_ring_ptr: std::ptr::null_mut(),
-
+            mem_region: None,
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
             uses_notif_suppression: false,
@@ -316,30 +280,17 @@ impl Queue {
             + std::mem::size_of::<u16>()
     }
 
-    fn get_aligned_slice_ptr<T, M: GuestMemoryBackend>(
-        &self,
-        mem: &M,
-        addr: GuestAddress,
-        len: usize,
-        alignment: usize,
-    ) -> Result<*mut T, QueueError> {
-        // Guest memory base address is page aligned, so as long as alignment divides page size,
-        // It suffices to check that the GPA is properly aligned (e.g. we don't need to recheck
-        // the HVA).
-        if addr.0 & (alignment as u64 - 1) != 0 {
+    fn check_alignment(addr: GuestAddress, alignment: u64) -> Result<(), QueueError> {
+        if addr.0 & (alignment - 1) != 0 {
             return Err(QueueError::PointerNotAligned(
                 u64_to_usize(addr.0),
-                alignment,
+                u64_to_usize(alignment),
             ));
         }
-
-        let slice = mem.get_slice(addr, len).map_err(QueueError::MemoryError)?;
-        slice.bitmap().mark_dirty(0, len);
-        Ok(slice.ptr_guard_mut().as_ptr().cast())
+        Ok(())
     }
 
-    /// Set up pointers to the queue objects in the guest memory
-    /// and mark memory dirty for those objects
+    /// Validate queue layout and resolve the region holding the rings.
     pub fn initialize<M: GuestMemoryBackend>(&mut self, mem: &M) -> Result<(), QueueError> {
         if !self.ready {
             return Err(QueueError::NotReady);
@@ -349,111 +300,95 @@ impl Queue {
             return Err(QueueError::InvalidSize(self.size));
         }
 
-        // All the below pointers are verified to be aligned properly; otherwise some methods (e.g.
-        // `read_volatile()`) will panic. Such an unalignment is possible when restored from a
-        // broken/fuzzed snapshot.
-        //
-        // Specification of those pointers' alignments
-        // https://docs.oasis-open.org/virtio/virtio/v1.2/csd01/virtio-v1.2-csd01.html#x1-350007
-        // > ================ ==========
-        // > Virtqueue Part    Alignment
-        // > ================ ==========
-        // > Descriptor Table 16
-        // > Available Ring   2
-        // > Used Ring        4
-        // > ================ ==========
-        self.desc_table_ptr =
-            self.get_aligned_slice_ptr(mem, self.desc_table_address, self.desc_table_size(), 16)?;
-        self.avail_ring_ptr =
-            self.get_aligned_slice_ptr(mem, self.avail_ring_address, self.avail_ring_size(), 2)?;
-        self.used_ring_ptr =
-            self.get_aligned_slice_ptr(mem, self.used_ring_address, self.used_ring_size(), 4)?;
+        // Verify alignment per VirtIO spec 1.2 Section 2.6:
+        // Descriptor Table: 16-byte aligned
+        // Available Ring: 2-byte aligned
+        // Used Ring: 4-byte aligned
+        Self::check_alignment(self.desc_table_address, 16)?;
+        Self::check_alignment(self.avail_ring_address, 2)?;
+        Self::check_alignment(self.used_ring_address, 4)?;
+
+        // Resolve each ring area (validates the range and marks it dirty). All
+        // three must lie within the same memory region.
+        let region = GuestRegion::new(mem, self.desc_table_address, self.desc_table_size())
+            .map_err(QueueError::MemoryError)?;
+        let avail = GuestRegion::new(mem, self.avail_ring_address, self.avail_ring_size())
+            .map_err(QueueError::MemoryError)?;
+        let used = GuestRegion::new(mem, self.used_ring_address, self.used_ring_size())
+            .map_err(QueueError::MemoryError)?;
+        if avail != region || used != region {
+            return Err(QueueError::MemoryError(
+                vm_memory::GuestMemoryError::InvalidGuestAddress(self.avail_ring_address),
+            ));
+        }
+        self.mem_region = Some(region);
 
         Ok(())
+    }
+
+    #[inline(always)]
+    fn mem_region(&self) -> &GuestRegion {
+        self.mem_region
+            .as_ref()
+            .expect("Queue accessed before initialization")
     }
 
     /// Get AvailRing.idx
     #[inline(always)]
     pub fn avail_ring_idx_get(&self) -> u16 {
-        // SAFETY: `idx` is 1 u16 away from the start
-        unsafe { self.avail_ring_ptr.add(1).read_volatile() }
+        let addr = self.avail_ring_address.unchecked_add(2);
+        self.mem_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Get element from AvailRing.ring at index
-    /// # Safety
-    /// The `index` parameter should be in 0..queue_size bounds
     #[inline(always)]
-    unsafe fn avail_ring_ring_get(&self, index: usize) -> u16 {
-        // SAFETY: `ring` is 2 u16 away from the start
-        unsafe { self.avail_ring_ptr.add(2).add(index).read_volatile() }
+    fn avail_ring_ring_get(&self, index: usize) -> u16 {
+        let addr = self.avail_ring_address.unchecked_add((4 + 2 * index) as u64);
+        self.mem_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Get AvailRing.used_event
     #[inline(always)]
     pub fn avail_ring_used_event_get(&self) -> u16 {
-        // SAFETY: `used_event` is 2 + self.len u16 away from the start
-        unsafe {
-            self.avail_ring_ptr
-                .add(2_usize.unchecked_add(usize::from(self.size)))
-                .read_volatile()
-        }
+        let addr = self
+            .avail_ring_address
+            .unchecked_add((4 + 2 * usize::from(self.size)) as u64);
+        self.mem_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Set UsedRing.idx
     #[inline(always)]
     pub fn used_ring_idx_set(&mut self, val: u16) {
-        // SAFETY: `idx` is 1 u16 away from the start
-        unsafe {
-            self.used_ring_ptr
-                .add(std::mem::size_of::<u16>())
-                .cast::<u16>()
-                .write_volatile(val)
-        }
+        let addr = self.used_ring_address.unchecked_add(2);
+        self.mem_region().write_obj(val, addr).unwrap();
     }
 
-    /// Get element from UsedRing.ring at index
-    /// # Safety
-    /// The `index` parameter should be in 0..queue_size bounds
+    /// Set element in UsedRing.ring at index
     #[inline(always)]
-    unsafe fn used_ring_ring_set(&mut self, index: usize, val: UsedElement) {
-        // SAFETY: `ring` is 2 u16 away from the start
-        unsafe {
-            self.used_ring_ptr
-                .add(std::mem::size_of::<u16>().unchecked_mul(2))
-                .cast::<UsedElement>()
-                .add(index)
-                .write_volatile(val)
-        }
+    fn used_ring_ring_set(&mut self, index: usize, val: UsedElement) {
+        let addr = self
+            .used_ring_address
+            .unchecked_add((4 + std::mem::size_of::<UsedElement>() * index) as u64);
+        self.mem_region().write_obj(val, addr).unwrap();
     }
 
+    /// Get UsedRing.avail_event
     #[cfg(any(test, kani))]
     #[inline(always)]
-    pub fn used_ring_avail_event_get(&mut self) -> u16 {
-        // SAFETY: `avail_event` is 2 * u16 and self.len * UsedElement away from the start
-        unsafe {
-            self.used_ring_ptr
-                .add(
-                    std::mem::size_of::<u16>().unchecked_mul(2)
-                        + std::mem::size_of::<UsedElement>().unchecked_mul(usize::from(self.size)),
-                )
-                .cast::<u16>()
-                .read_volatile()
-        }
+    pub fn used_ring_avail_event_get(&self) -> u16 {
+        let addr = self.used_ring_address.unchecked_add(
+            (4 + std::mem::size_of::<UsedElement>() * usize::from(self.size)) as u64,
+        );
+        self.mem_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Set UsedRing.avail_event
     #[inline(always)]
     pub fn used_ring_avail_event_set(&mut self, val: u16) {
-        // SAFETY: `avail_event` is 2 * u16 and self.len * UsedElement away from the start
-        unsafe {
-            self.used_ring_ptr
-                .add(
-                    std::mem::size_of::<u16>().unchecked_mul(2)
-                        + std::mem::size_of::<UsedElement>().unchecked_mul(usize::from(self.size)),
-                )
-                .cast::<u16>()
-                .write_volatile(val)
-        }
+        let addr = self.used_ring_address.unchecked_add(
+            (4 + std::mem::size_of::<UsedElement>() * usize::from(self.size)) as u64,
+        );
+        self.mem_region().write_obj(val, addr).unwrap();
     }
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
@@ -542,9 +477,15 @@ impl Queue {
         let idx = self.next_avail.0 % self.size;
         // SAFETY:
         // index is bound by the queue size
-        let desc_index = unsafe { self.avail_ring_ring_get(usize::from(idx)) };
+        let desc_index = self.avail_ring_ring_get(usize::from(idx));
 
-        DescriptorChain::checked_new(self.desc_table_ptr, self.size, desc_index).inspect(|_| {
+        DescriptorChain::checked_new(
+            *self.mem_region(),
+            self.desc_table_address,
+            self.size,
+            desc_index,
+        )
+        .inspect(|_| {
             self.next_avail += Wrapping(1);
         })
     }
@@ -579,9 +520,7 @@ impl Queue {
         };
         // SAFETY:
         // index is bound by the queue size
-        unsafe {
-            self.used_ring_ring_set(usize::from(next_used), used_element);
-        }
+        self.used_ring_ring_set(usize::from(next_used), used_element);
         Ok(())
     }
 
@@ -1229,8 +1168,12 @@ mod tests {
 
         assert!(vq.end().0 < 0x1000);
 
+        let region = *q.mem_region();
+
         // index >= queue_size
-        assert!(DescriptorChain::checked_new(q.desc_table_ptr, 16, 16).is_none());
+        assert!(
+            DescriptorChain::checked_new(region, q.desc_table_address, 16, 16).is_none()
+        );
 
         // Let's create an invalid chain.
         {
@@ -1241,7 +1184,9 @@ mod tests {
             // .. but the index of the next descriptor is too large
             vq.dtable[0].next.set(16);
 
-            assert!(DescriptorChain::checked_new(q.desc_table_ptr, 16, 0).is_none());
+            assert!(
+                DescriptorChain::checked_new(region, q.desc_table_address, 16, 0).is_none()
+            );
         }
 
         // Finally, let's test an ok chain.
@@ -1249,9 +1194,9 @@ mod tests {
             vq.dtable[0].next.set(1);
             vq.dtable[1].set(0x2000, 0x1000, 0, 0);
 
-            let c = DescriptorChain::checked_new(q.desc_table_ptr, 16, 0).unwrap();
+            let c = DescriptorChain::checked_new(region, q.desc_table_address, 16, 0).unwrap();
 
-            assert_eq!(c.desc_table_ptr, q.desc_table_ptr);
+            assert_eq!(c.desc_table, q.desc_table_address);
             assert_eq!(c.queue_size, 16);
             assert_eq!(c.ttl, c.queue_size);
             assert_eq!(c.index, 0);

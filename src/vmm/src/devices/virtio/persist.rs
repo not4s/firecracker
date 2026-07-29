@@ -97,7 +97,9 @@ impl Persist<'_> for Queue {
             avail_ring_address: GuestAddress(state.avail_ring),
             used_ring_address: GuestAddress(state.used_ring),
 
-            mem_region: None,
+            desc_region: None,
+            avail_region: None,
+            used_region: None,
             next_avail: state.next_avail,
             next_used: state.next_used,
             uses_notif_suppression: false,

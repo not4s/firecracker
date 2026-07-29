@@ -231,8 +231,11 @@ pub struct Queue {
     /// Guest physical address of the used ring
     pub used_ring_address: GuestAddress,
 
-    /// Resolved region holding the rings, set by `initialize`.
-    pub(crate) mem_region: Option<GuestRegion>,
+    /// Per-ring resolved windows, set by `initialize`. Each is sized to its own
+    /// ring so per-access bounds checks are against a small length.
+    pub(crate) desc_region: Option<GuestRegion>,
+    pub(crate) avail_region: Option<GuestRegion>,
+    pub(crate) used_region: Option<GuestRegion>,
 
     pub next_avail: Wrapping<u16>,
     pub next_used: Wrapping<u16>,
@@ -254,7 +257,9 @@ impl Queue {
             desc_table_address: GuestAddress(0),
             avail_ring_address: GuestAddress(0),
             used_ring_address: GuestAddress(0),
-            mem_region: None,
+            desc_region: None,
+            avail_region: None,
+            used_region: None,
             next_avail: Wrapping(0),
             next_used: Wrapping(0),
             uses_notif_suppression: false,
@@ -308,27 +313,41 @@ impl Queue {
         Self::check_alignment(self.avail_ring_address, 2)?;
         Self::check_alignment(self.used_ring_address, 4)?;
 
-        // Resolve each ring area (validates the range and marks it dirty). All
-        // three must lie within the same memory region.
-        let region = GuestRegion::new(mem, self.desc_table_address, self.desc_table_size())
-            .map_err(QueueError::MemoryError)?;
-        let avail = GuestRegion::new(mem, self.avail_ring_address, self.avail_ring_size())
-            .map_err(QueueError::MemoryError)?;
-        let used = GuestRegion::new(mem, self.used_ring_address, self.used_ring_size())
-            .map_err(QueueError::MemoryError)?;
-        if avail != region || used != region {
-            return Err(QueueError::MemoryError(
-                vm_memory::GuestMemoryError::InvalidGuestAddress(self.avail_ring_address),
-            ));
-        }
-        self.mem_region = Some(region);
+        // Resolve each ring into its own window (validates the range and marks
+        // it dirty), so per-access bounds checks are against a ring-sized length.
+        self.desc_region = Some(
+            GuestRegion::new(mem, self.desc_table_address, self.desc_table_size())
+                .map_err(QueueError::MemoryError)?,
+        );
+        self.avail_region = Some(
+            GuestRegion::new(mem, self.avail_ring_address, self.avail_ring_size())
+                .map_err(QueueError::MemoryError)?,
+        );
+        self.used_region = Some(
+            GuestRegion::new(mem, self.used_ring_address, self.used_ring_size())
+                .map_err(QueueError::MemoryError)?,
+        );
 
         Ok(())
     }
 
     #[inline(always)]
-    fn mem_region(&self) -> &GuestRegion {
-        self.mem_region
+    fn desc_region(&self) -> &GuestRegion {
+        self.desc_region
+            .as_ref()
+            .expect("Queue accessed before initialization")
+    }
+
+    #[inline(always)]
+    fn avail_region(&self) -> &GuestRegion {
+        self.avail_region
+            .as_ref()
+            .expect("Queue accessed before initialization")
+    }
+
+    #[inline(always)]
+    fn used_region(&self) -> &GuestRegion {
+        self.used_region
             .as_ref()
             .expect("Queue accessed before initialization")
     }
@@ -337,14 +356,14 @@ impl Queue {
     #[inline(always)]
     pub fn avail_ring_idx_get(&self) -> u16 {
         let addr = self.avail_ring_address.unchecked_add(2);
-        self.mem_region().read_obj::<u16>(addr).unwrap()
+        self.avail_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Get element from AvailRing.ring at index
     #[inline(always)]
     fn avail_ring_ring_get(&self, index: usize) -> u16 {
         let addr = self.avail_ring_address.unchecked_add((4 + 2 * index) as u64);
-        self.mem_region().read_obj::<u16>(addr).unwrap()
+        self.avail_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Get AvailRing.used_event
@@ -353,14 +372,14 @@ impl Queue {
         let addr = self
             .avail_ring_address
             .unchecked_add((4 + 2 * usize::from(self.size)) as u64);
-        self.mem_region().read_obj::<u16>(addr).unwrap()
+        self.avail_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Set UsedRing.idx
     #[inline(always)]
     pub fn used_ring_idx_set(&mut self, val: u16) {
         let addr = self.used_ring_address.unchecked_add(2);
-        self.mem_region().write_obj(val, addr).unwrap();
+        self.used_region().write_obj(val, addr).unwrap();
     }
 
     /// Set element in UsedRing.ring at index
@@ -369,7 +388,7 @@ impl Queue {
         let addr = self
             .used_ring_address
             .unchecked_add((4 + std::mem::size_of::<UsedElement>() * index) as u64);
-        self.mem_region().write_obj(val, addr).unwrap();
+        self.used_region().write_obj(val, addr).unwrap();
     }
 
     /// Get UsedRing.avail_event
@@ -379,7 +398,7 @@ impl Queue {
         let addr = self.used_ring_address.unchecked_add(
             (4 + std::mem::size_of::<UsedElement>() * usize::from(self.size)) as u64,
         );
-        self.mem_region().read_obj::<u16>(addr).unwrap()
+        self.used_region().read_obj::<u16>(addr).unwrap()
     }
 
     /// Set UsedRing.avail_event
@@ -388,7 +407,7 @@ impl Queue {
         let addr = self.used_ring_address.unchecked_add(
             (4 + std::mem::size_of::<UsedElement>() * usize::from(self.size)) as u64,
         );
-        self.mem_region().write_obj(val, addr).unwrap();
+        self.used_region().write_obj(val, addr).unwrap();
     }
 
     /// Returns the number of yet-to-be-popped descriptor chains in the avail ring.
@@ -480,7 +499,7 @@ impl Queue {
         let desc_index = self.avail_ring_ring_get(usize::from(idx));
 
         DescriptorChain::checked_new(
-            *self.mem_region(),
+            *self.desc_region(),
             self.desc_table_address,
             self.size,
             desc_index,
@@ -1168,7 +1187,7 @@ mod tests {
 
         assert!(vq.end().0 < 0x1000);
 
-        let region = *q.mem_region();
+        let region = *q.desc_region();
 
         // index >= queue_size
         assert!(

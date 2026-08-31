@@ -695,21 +695,28 @@ impl GuestRegionMmapExt {
         assert!(self.region_type == GuestRegionType::Hotpluggable);
 
         let mut bitmap_guard = self.plugged.lock().unwrap();
-        let prev = bitmap_guard.replace((mem_slot.slot - self.slot_from) as usize, plug);
-        // do not do anything if the state is what we're trying to set
-        if prev == plug {
+        let idx = (mem_slot.slot - self.slot_from) as usize;
+        // do not do anything if the state is already what we're trying to set
+        if bitmap_guard[idx] == plug {
             return Ok(());
         }
 
+        // Commit the bitmap only after the KVM update succeeds, so on failure it still matches KVM.
         let mut kvm_region = kvm_userspace_memory_region::from(mem_slot);
         if plug {
             // make it accessible _before_ adding it to KVM
             mem_slot.protect(false)?;
-            vm.set_user_memory_region(kvm_region)?;
+            if let Err(err) = vm.set_user_memory_region(kvm_region) {
+                // The slot never entered KVM; undo the protection so it still matches the bitmap.
+                let _ = mem_slot.protect(true);
+                return Err(err);
+            }
+            bitmap_guard.set(idx, true);
         } else {
             // to remove it we need to pass a size of zero
             kvm_region.memory_size = 0;
             vm.set_user_memory_region(kvm_region)?;
+            bitmap_guard.set(idx, false);
             // make it protected _after_ removing it from KVM
             mem_slot.protect(true)?;
         }

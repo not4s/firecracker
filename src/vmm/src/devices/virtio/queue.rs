@@ -11,7 +11,9 @@ use vm_memory::GuestMemoryBackend;
 
 use crate::logger::error;
 use crate::utils::u64_to_usize;
-use crate::vstate::memory::{ByteValued, GuestAddress, GuestMemoryMmap, MemoryRegionCache};
+use crate::vstate::memory::{
+    ByteValued, DirtyBitmapRegion, GuestAddress, GuestMemoryMmap, MemoryRegionCache,
+};
 
 pub const VIRTQ_DESC_F_NEXT: u16 = 0x1;
 pub const VIRTQ_DESC_F_WRITE: u16 = 0x2;
@@ -304,7 +306,10 @@ impl Queue {
     }
 
     /// Resolve the queue objects in the guest memory and mark them dirty.
-    pub fn initialize<M: GuestMemoryBackend>(&mut self, mem: &M) -> Result<(), QueueError> {
+    pub fn initialize<M: GuestMemoryBackend>(&mut self, mem: &M) -> Result<(), QueueError>
+    where
+        M::R: DirtyBitmapRegion,
+    {
         if !self.ready {
             return Err(QueueError::NotReady);
         }

@@ -42,18 +42,42 @@ pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
 #[repr(C, packed)]
 struct Packed<T>(T);
 
+/// The dirty-page bitmap of a guest memory region, for callers that write to the region
+/// through a cached host pointer and must mark those writes themselves.
+pub trait DirtyBitmapRegion {
+    /// Returns the region's bitmap, or `None` when dirty page tracking is disabled.
+    fn dirty_bitmap(&self) -> Option<&AtomicBitmap>;
+}
+
+impl DirtyBitmapRegion for GuestRegionMmapExt {
+    fn dirty_bitmap(&self) -> Option<&AtomicBitmap> {
+        MmapRegion::bitmap(self).as_ref()
+    }
+}
+
+impl DirtyBitmapRegion for vm_memory::GuestRegionMmap<()> {
+    fn dirty_bitmap(&self) -> Option<&AtomicBitmap> {
+        None
+    }
+}
+
 /// A resolved reference to a range of guest memory, bounds-checked on every access against
-/// the length validated at construction.
+/// the length validated at construction. Writes mark the region's dirty bitmap.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemoryRegionCache {
     base: *mut u8,
     len: usize,
+    /// The region's dirty bitmap, or null when dirty page tracking is disabled.
+    bitmap: *const AtomicBitmap,
+    /// Offset of `base` within its region, which is the bitmap's coordinate space.
+    region_offset: usize,
 }
 
 // SAFETY: `base` is only dereferenced through the volatile, bounds-checked accessors below,
-// within the `len` bytes that `new` validated against a single region. Guest memory is owned
-// by the `Vmm` and is never unmapped while devices exist, so the mapping outlives every cache
-// regardless of which thread holds it.
+// within the `len` bytes that `new` validated against a single region, and `bitmap` is only
+// read through `AtomicBitmap`'s atomic operations. Both point into that region. Guest memory
+// is owned by the `Vmm` and is never unmapped while devices exist, so the region outlives
+// every cache regardless of which thread holds it.
 unsafe impl Send for MemoryRegionCache {}
 
 impl MemoryRegionCache {
@@ -61,6 +85,8 @@ impl MemoryRegionCache {
     pub const EMPTY: Self = Self {
         base: NonNull::<u8>::dangling().as_ptr(),
         len: 0,
+        bitmap: std::ptr::null(),
+        region_offset: 0,
     };
 
     /// Resolves `addr..addr + len`, which must lie within a single region, and marks it dirty.
@@ -68,7 +94,10 @@ impl MemoryRegionCache {
         mem: &M,
         addr: GuestAddress,
         len: usize,
-    ) -> Result<Self, GuestMemoryError> {
+    ) -> Result<Self, GuestMemoryError>
+    where
+        M::R: DirtyBitmapRegion,
+    {
         let region = mem
             .find_region(addr)
             .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
@@ -80,6 +109,10 @@ impl MemoryRegionCache {
         Ok(Self {
             base: slice.ptr_guard_mut().as_ptr(),
             len,
+            bitmap: region
+                .dirty_bitmap()
+                .map_or(std::ptr::null(), std::ptr::from_ref),
+            region_offset: u64_to_usize(region_addr.raw_value()),
         })
     }
 
@@ -103,7 +136,7 @@ impl MemoryRegionCache {
         Ok(unsafe { self.base.add(offset).cast::<Packed<T>>().read_volatile().0 })
     }
 
-    /// Writes a `T` at `offset` bytes into the range.
+    /// Writes a `T` at `offset` bytes into the range and marks it dirty.
     #[inline]
     pub fn write_obj<T: ByteValued>(&self, val: T, offset: usize) -> Result<(), GuestMemoryError> {
         self.check::<T>(offset)?;
@@ -114,6 +147,12 @@ impl MemoryRegionCache {
                 .cast::<Packed<T>>()
                 .write_volatile(Packed(val))
         };
+        if !self.bitmap.is_null() {
+            // SAFETY: non-null `bitmap` came from the region `base` points into and lives as
+            // long as that region does (see the `Send` impl).
+            unsafe { &*self.bitmap }
+                .mark_dirty(self.region_offset + offset, std::mem::size_of::<T>());
+        }
         Ok(())
     }
 }
@@ -1373,6 +1412,52 @@ mod tests {
 
         MemoryRegionCache::EMPTY.read_obj::<u8>(0).unwrap_err();
         MemoryRegionCache::EMPTY.write_obj::<u8>(0, 0).unwrap_err();
+    }
+
+    #[test]
+    fn test_memory_region_cache_marks_dirty() {
+        let page_size = host_page_size();
+        let mem = into_region_ext(
+            anonymous(
+                vec![(GuestAddress(0), page_size * 4)].into_iter(),
+                true,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let bitmap = |addr: u64| {
+            mem.find_region(GuestAddress(addr))
+                .unwrap()
+                .dirty_bitmap()
+                .unwrap()
+        };
+        let cache_start = page_size as u64 * 2;
+
+        // Construction marks the whole range.
+        let cache = MemoryRegionCache::new(&mem, GuestAddress(cache_start), page_size).unwrap();
+        assert!(bitmap(cache_start).dirty_at(page_size * 2));
+
+        // Reads do not mark, writes do, and only the written page.
+        mem.reset_dirty();
+        cache.read_obj::<u32>(0).unwrap();
+        assert!(!bitmap(cache_start).dirty_at(page_size * 2));
+        cache.write_obj::<u32>(1, 8).unwrap();
+        assert!(bitmap(cache_start).dirty_at(page_size * 2));
+        assert!(!bitmap(cache_start).dirty_at(page_size));
+        assert!(!bitmap(cache_start).dirty_at(page_size * 3));
+
+        // Without dirty page tracking, writes still work.
+        let untracked = into_region_ext(
+            anonymous(
+                vec![(GuestAddress(0), page_size)].into_iter(),
+                false,
+                HugePageConfig::None,
+            )
+            .unwrap(),
+        );
+        let cache = MemoryRegionCache::new(&untracked, GuestAddress(0), 0x10).unwrap();
+        cache.write_obj::<u32>(1, 0).unwrap();
+        assert_eq!(cache.read_obj::<u32>(0).unwrap(), 1);
     }
 
     #[test]

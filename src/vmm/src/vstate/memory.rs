@@ -11,6 +11,7 @@ use std::io;
 use std::io::SeekFrom;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
+use std::ptr::NonNull;
 use std::sync::{Arc, Mutex};
 
 use bitvec::vec::BitVec;
@@ -36,6 +37,86 @@ use crate::{DirtyBitmap, align_up, warn_unrestricted};
 
 /// Type of GuestMemoryMmap.
 pub type GuestMemoryMmap = vm_memory::GuestRegionCollection<GuestRegionMmapExt>;
+
+/// A `T` with alignment 1, so a volatile access to it is defined at any address.
+#[repr(C, packed)]
+struct Packed<T>(T);
+
+/// A resolved reference to a range of guest memory, bounds-checked on every access against
+/// the length validated at construction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryRegionCache {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `base` is only dereferenced through the volatile, bounds-checked accessors below,
+// within the `len` bytes that `new` validated against a single region. Guest memory is owned
+// by the `Vmm` and is never unmapped while devices exist, so the mapping outlives every cache
+// regardless of which thread holds it.
+unsafe impl Send for MemoryRegionCache {}
+
+impl MemoryRegionCache {
+    /// A cache over an empty range: every access fails its bounds check.
+    pub const EMPTY: Self = Self {
+        base: NonNull::<u8>::dangling().as_ptr(),
+        len: 0,
+    };
+
+    /// Resolves `addr..addr + len`, which must lie within a single region, and marks it dirty.
+    pub fn new<M: GuestMemoryBackend>(
+        mem: &M,
+        addr: GuestAddress,
+        len: usize,
+    ) -> Result<Self, GuestMemoryError> {
+        let region = mem
+            .find_region(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let region_addr = region
+            .to_region_addr(addr)
+            .ok_or(GuestMemoryError::InvalidGuestAddress(addr))?;
+        let slice = region.get_slice(region_addr, len)?;
+        slice.bitmap().mark_dirty(0, len);
+        Ok(Self {
+            base: slice.ptr_guard_mut().as_ptr(),
+            len,
+        })
+    }
+
+    #[inline]
+    fn check<T>(&self, offset: usize) -> Result<(), GuestMemoryError> {
+        if offset
+            .checked_add(std::mem::size_of::<T>())
+            .is_none_or(|end| end > self.len)
+        {
+            return Err(GuestMemoryError::InvalidBackendAddress);
+        }
+        Ok(())
+    }
+
+    /// Reads a `T` at `offset` bytes into the range.
+    #[inline]
+    pub fn read_obj<T: ByteValued>(&self, offset: usize) -> Result<T, GuestMemoryError> {
+        self.check::<T>(offset)?;
+        // SAFETY: `check` keeps `[offset, offset + size_of::<T>())` within the range validated
+        // in `new`; `Packed<T>` is 1-aligned, so the volatile read is defined at any address.
+        Ok(unsafe { self.base.add(offset).cast::<Packed<T>>().read_volatile().0 })
+    }
+
+    /// Writes a `T` at `offset` bytes into the range.
+    #[inline]
+    pub fn write_obj<T: ByteValued>(&self, val: T, offset: usize) -> Result<(), GuestMemoryError> {
+        self.check::<T>(offset)?;
+        // SAFETY: as in `read_obj`.
+        unsafe {
+            self.base
+                .add(offset)
+                .cast::<Packed<T>>()
+                .write_volatile(Packed(val))
+        };
+        Ok(())
+    }
+}
 
 /// The alignment used to allocate guest memory.
 /// Chosen to enable optimizations on host kernel, e.g. allow huge pages at the beginning of the memory space.
@@ -1185,7 +1266,7 @@ mod tests {
     use super::*;
     use crate::arch::host_page_size;
     use crate::snapshot::Snapshot;
-    use crate::test_utils::single_region_mem;
+    use crate::test_utils::{multi_region_mem, single_region_mem};
     use crate::utils::mib_to_bytes;
     use crate::vstate::memory::test_utils::into_region_ext;
 
@@ -1263,6 +1344,35 @@ mod tests {
         let regions = vec![(GuestAddress(0), 2 * page_size)];
         let result = snapshot_file(file, regions.into_iter(), false, HugePageConfig::None);
         assert!(matches!(result.unwrap_err(), MemoryError::OffsetTooLarge));
+    }
+
+    #[test]
+    fn test_memory_region_cache() {
+        let mem = multi_region_mem(&[(GuestAddress(0), 0x1000), (GuestAddress(0x1000), 0x1000)]);
+
+        // The range must lie within a single region.
+        MemoryRegionCache::new(&mem, GuestAddress(0xff8), 0x10).unwrap_err();
+        MemoryRegionCache::new(&mem, GuestAddress(0x3000), 0x10).unwrap_err();
+
+        let cache = MemoryRegionCache::new(&mem, GuestAddress(0x100), 0x10).unwrap();
+        cache.write_obj::<u32>(0xdead_beef, 0).unwrap();
+        assert_eq!(cache.read_obj::<u32>(0).unwrap(), 0xdead_beef);
+        assert_eq!(
+            mem.read_obj::<u32>(GuestAddress(0x100)).unwrap(),
+            0xdead_beef
+        );
+        // Misaligned offsets are defined and read the same bytes.
+        assert_eq!(cache.read_obj::<u16>(1).unwrap(), 0xadbe);
+
+        // The bound is the validated range, not the region.
+        cache.read_obj::<u32>(0xc).unwrap();
+        cache.read_obj::<u32>(0xd).unwrap_err();
+        cache.read_obj::<u8>(0x10).unwrap_err();
+        cache.read_obj::<u8>(usize::MAX).unwrap_err();
+        cache.write_obj::<u8>(0, 0x10).unwrap_err();
+
+        MemoryRegionCache::EMPTY.read_obj::<u8>(0).unwrap_err();
+        MemoryRegionCache::EMPTY.write_obj::<u8>(0, 0).unwrap_err();
     }
 
     #[test]

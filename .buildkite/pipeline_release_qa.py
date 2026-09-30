@@ -6,20 +6,42 @@
 Buildkite pipeline for release QA
 """
 
+import os
+
 from common import BKPipeline
 
-pipeline = BKPipeline(with_build_step=False)
+# Release tag builds don't get a VERSION, so use the tag. Step env overrides the build's.
+version = os.environ.get("BUILDKITE_TAG") or os.environ["VERSION"]
+pipeline = BKPipeline(with_build_step=False, env={"VERSION": version})
 
 # NOTE: we need to escape $ using $$ otherwise buildkite tries to replace it instead of the shell
 
+# The release build starts from the same tag push, so retry until it has uploaded every file
+# listed in SHA256SUMS.
 pipeline.add_step(
     {
         "label": "download-release",
         "if": 'build.env("VERSION") != "dev"',
         "command": [
-            "aws s3 sync --no-sign-request s3://spec.ccfc.min/firecracker-ci/firecracker/$$VERSION release-$$VERSION",
+            (
+                "for arch in x86_64 aarch64; do"
+                "  RELEASE_DIR=release-$$VERSION-$$arch;"
+                "  OUT_DIR=release-$$VERSION/$$arch;"
+                "  until aws s3 sync s3://firecracker-release-prod-us-east-1/$$VERSION/$$arch $$RELEASE_DIR"
+                "    && (cd $$RELEASE_DIR && sha256sum --quiet -c SHA256SUMS); do"
+                "    sleep 60;"
+                "  done;"
+                "  mkdir -p $$OUT_DIR;"
+                "  for f in $$RELEASE_DIR/*-$$arch; do"
+                "    mv $$f $$OUT_DIR/$$(basename $$f -$$VERSION-$$arch);"
+                "    mv $$f.debug $$OUT_DIR/$$(basename $$f -$$VERSION-$$arch).debug;"
+                "  done;"
+                "done"
+            ),
             'buildkite-agent artifact upload "release-$$VERSION/**/*"',
         ],
+        "env": {"VERSION": version},
+        "timeout_in_minutes": 60,
     },
     depends_on_build=False,
 )
@@ -69,6 +91,7 @@ pipeline.add_step(
             "| jq '(..|select(.priority? != null).priority) += 100' "
             "| buildkite-agent pipeline upload"
         ),
+        "env": {"VERSION": version},
     },
     depends_on_build=False,
 )
